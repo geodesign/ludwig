@@ -36,7 +36,15 @@ from matplotlib import ticker
 from matplotlib.lines import Line2D
 from mpl_toolkits.mplot3d import Axes3D
 
-
+# if we have a non_gui back end, then need to plot to disk
+current_backend = matplotlib.get_backend()
+print("Default system matplotlib backend is: " + current_backend)
+non_gui_backends = matplotlib.rcsetup.non_interactive_bk
+if not current_backend in non_gui_backends:
+    print("Switching to non-gui figure plotting")
+    mpl.use('pgf')
+print ("Alternative non-gui backends are:", non_gui_backends)
+    
 # plt.rc('xtick', labelsize='x-large')
 # plt.rc('ytick', labelsize='x-large')
 # plt.rc('axes', labelsize='x-large')

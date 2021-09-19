@@ -14,27 +14,42 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-from __future__ import absolute_import
-from __future__ import division
-
+import copy
+import logging
+import sys
 from collections import Counter
 from sys import platform
 
-import copy
-import logging
-import matplotlib as mpl
-
-if platform == "darwin":  # OS X
-    mpl.use('TkAgg')
-import matplotlib.patches as patches
-import matplotlib.path as path
-import matplotlib.patheffects as PathEffects
-import matplotlib.pyplot as plt
 import numpy as np
-import seaborn as sns
-from matplotlib import ticker
-from matplotlib.lines import Line2D
-from mpl_toolkits.mplot3d import Axes3D
+import pandas as pd
+
+from ludwig.constants import TRAINING, TYPE, VALIDATION
+
+logger = logging.getLogger(__name__)
+
+try:
+    import matplotlib as mpl
+
+    if platform == "darwin":  # OS X
+        mpl.use('TkAgg')
+    import matplotlib.patches as patches
+    import matplotlib.path as path
+    import matplotlib.patheffects as PathEffects
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    from matplotlib import ticker
+    from matplotlib.lines import Line2D
+    from mpl_toolkits.mplot3d import Axes3D
+except ImportError:
+    logger.error(
+        ' matplotlib or seaborn are not installed. '
+        'In order to install all visualization dependencies run '
+        'pip install ludwig[viz]'
+    )
+    sys.exit(-1)
+
+INT_QUANTILES = 10
+FLOAT_QUANTILES = 10
 
 # if we have a non_gui back end, then need to plot to disk
 current_backend = matplotlib.get_backend()
@@ -49,8 +64,22 @@ print ("Alternative non-gui backends are:", non_gui_backends)
 # plt.rc('ytick', labelsize='x-large')
 # plt.rc('axes', labelsize='x-large')
 
-def learning_curves_plot(train_values, vali_values, metric, algorithm_names=None,
-                        title=None):
+def visualize_callbacks(callbacks, fig):
+    if callbacks is None:
+        return
+    for callback in callbacks:
+        callback.on_visualize_figure(fig)
+
+
+def learning_curves_plot(
+        train_values,
+        vali_values,
+        metric,
+        algorithm_names=None,
+        title=None,
+        filename=None,
+        callbacks=None
+):
     num_algorithms = len(train_values)
     max_len = max([len(tv) for tv in train_values])
 
@@ -78,19 +107,34 @@ def learning_curves_plot(train_values, vali_values, metric, algorithm_names=None
         name_prefix = algorithm_names[
                           i] + ' ' if algorithm_names is not None and i < len(
             algorithm_names) else ''
-        ax.plot(xs, train_values[i], label=name_prefix + 'training',
+        ax.plot(xs[:len(train_values[i])], train_values[i],
+                label=name_prefix + TRAINING,
                 color=colors[i * 2], linewidth=3)
-        if i < len(vali_values):
-            ax.plot(xs, vali_values[i], label=name_prefix + 'validation',
+        if i < len(vali_values) and vali_values[i] is not None and len(
+                vali_values[i]) > 0:
+            ax.plot(xs[:len(vali_values[i])], vali_values[i],
+                    label=name_prefix + VALIDATION,
                     color=colors[i * 2 + 1], linewidth=3)
 
     ax.legend()
     plt.tight_layout()
-    plt.show()
+    visualize_callbacks(callbacks, plt.gcf())
+    if filename:
+        plt.savefig(filename)
+    else:
+        plt.show()
 
 
-def compare_classifiers_plot(scores, metrics, algoritm_names=None,
-                             adaptive=False, decimals=4, title=None):
+def compare_classifiers_plot(
+        scores,
+        metrics,
+        algoritm_names=None,
+        adaptive=False,
+        decimals=4,
+        title=None,
+        filename=None,
+        callbacks=None,
+):
     assert len(scores) == len(metrics)
     assert len(scores) > 0
 
@@ -148,11 +192,22 @@ def compare_classifiers_plot(scores, metrics, algoritm_names=None,
 
     ax.legend(loc='center left', bbox_to_anchor=(1, 0.5))
     plt.tight_layout()
-    plt.show()
+    visualize_callbacks(callbacks, plt.gcf())
+    if filename:
+        plt.savefig(filename)
+    else:
+        plt.show()
 
 
-def compare_classifiers_line_plot(xs, scores, metric, algorithm_names=None,
-                                  title=None):
+def compare_classifiers_line_plot(
+        xs,
+        scores,
+        metric,
+        algorithm_names=None,
+        title=None,
+        filename=None,
+        callbacks=None,
+):
     sns.set_style('whitegrid')
     colors = plt.get_cmap('tab10').colors
 
@@ -179,11 +234,21 @@ def compare_classifiers_line_plot(xs, scores, metric, algorithm_names=None,
 
     ax.legend(loc='center left', bbox_to_anchor=(1, 0.5))
     plt.tight_layout()
-    plt.show()
+    visualize_callbacks(callbacks, plt.gcf())
+    if filename:
+        plt.savefig(filename)
+    else:
+        plt.show()
 
 
-def compare_classifiers_multiclass_multimetric_plot(scores, metrics,
-                                                    labels=None, title=None):
+def compare_classifiers_multiclass_multimetric_plot(
+        scores,
+        metrics,
+        labels=None,
+        title=None,
+        filename=None,
+        callbacks=None,
+):
     assert len(scores) > 0
 
     sns.set_style('whitegrid')
@@ -210,11 +275,22 @@ def compare_classifiers_multiclass_multimetric_plot(scores, metrics,
 
     ax.legend(loc='center left', bbox_to_anchor=(1, 0.5))
     plt.tight_layout()
-    plt.show()
+    visualize_callbacks(callbacks, plt.gcf())
+    if filename:
+        plt.savefig(filename)
+    else:
+        plt.show()
 
 
-def radar_chart(ground_truth, predictions, algorithms=None, log_scale=False,
-                title=None):
+def radar_chart(
+        ground_truth,
+        predictions,
+        algorithms=None,
+        log_scale=False,
+        title=None,
+        filename=None,
+        callbacks=None,
+):
     sns.set_style('whitegrid')
 
     if title is not None:
@@ -224,7 +300,7 @@ def radar_chart(ground_truth, predictions, algorithms=None, log_scale=False,
     predictions = [pred[0:10] for pred in predictions]
 
     gt_argsort = np.argsort(-ground_truth)  # sort deacreasing
-    logging.info(gt_argsort)
+    logger.info(gt_argsort)
     ground_truth = ground_truth[gt_argsort]
     predictions = [pred[gt_argsort] for pred in predictions]
 
@@ -287,7 +363,11 @@ def radar_chart(ground_truth, predictions, algorithms=None, log_scale=False,
 
     ax.legend(frameon=True, loc='upper left')
     plt.tight_layout()
-    plt.show()
+    visualize_callbacks(callbacks, plt.gcf())
+    if filename:
+        plt.savefig(filename)
+    else:
+        plt.show()
 
 
 def pie(ax, values, **kwargs):
@@ -303,9 +383,18 @@ def pie(ax, values, **kwargs):
     return wedges
 
 
-def donut(inside_values, inside_labels, outside_values, outside_labels,
-          outside_groups, title=None):
-    fig, ax = plt.subplots()
+def donut(
+        inside_values,
+        inside_labels,
+        outside_values,
+        outside_labels,
+        outside_groups,
+        title=None,
+        tight_layout=None,
+        filename=None,
+        callbacks=None,
+):
+    fig, ax = plt.subplots(figsize=(7,5))
 
     if title is not None:
         ax.set_title(title)
@@ -349,8 +438,9 @@ def donut(inside_values, inside_labels, outside_values, outside_labels,
                  pctdistance=1 - (width / 2) / (1 - width),
                  colors=inside_colors, startangle=90, counterclock=False,
                  textprops={'color': 'w', 'weight': 'bold',
-                            'path_effects': [PathEffects.withStroke(linewidth=3,
-                                                                    foreground='black')]})
+                            'path_effects': [
+                                PathEffects.withStroke(linewidth=3,
+                                                       foreground='black')]})
     plt.setp(inside + outside, width=width, edgecolor='white')
 
     wedges = []
@@ -364,13 +454,26 @@ def donut(inside_values, inside_labels, outside_values, outside_labels,
             labels.append(outside_labels[so_far])
             so_far += 1
 
-    ax.legend(wedges, labels, frameon=True)
-    plt.tight_layout()
-    plt.show()
+    if tight_layout:
+        ax.legend(wedges, labels, frameon=True, loc=1, bbox_to_anchor=(1.30, 1.00))
+    else:
+        ax.legend(wedges, labels, frameon=True, loc=1, bbox_to_anchor=(1.50, 1.00))
+    visualize_callbacks(callbacks, plt.gcf())
+    if filename:
+        plt.savefig(filename, bbox_inches = "tight")
+    else:
+        plt.show()
 
 
-def confidence_fitlering_plot(thresholds, accuracies, dataset_kepts,
-                              algorithm_names=None, title=None):
+def confidence_fitlering_plot(
+        thresholds,
+        accuracies,
+        dataset_kepts,
+        algorithm_names=None,
+        title=None,
+        filename=None,
+        callbacks=None,
+):
     assert len(accuracies) == len(dataset_kepts)
     num_algorithms = len(accuracies)
 
@@ -425,15 +528,24 @@ def confidence_fitlering_plot(thresholds, accuracies, dataset_kepts,
 
     ax1.legend(frameon=True, loc=3)
     plt.tight_layout()
-    plt.show()
+    visualize_callbacks(callbacks, plt.gcf())
+    if filename:
+        plt.savefig(filename)
+    else:
+        plt.show()
 
 
-def confidence_fitlering_data_vs_acc_plot(accuracies, dataset_kepts,
-                                          model_names=None,
-                                          dotted=False,
-                                          decimal_digits=0,
-                                          y_label='accuracy',
-                                          title=None):
+def confidence_fitlering_data_vs_acc_plot(
+        accuracies,
+        dataset_kepts,
+        model_names=None,
+        dotted=False,
+        decimal_digits=0,
+        y_label='accuracy',
+        title=None,
+        filename=None,
+        callbacks=None,
+):
     assert len(accuracies) == len(dataset_kepts)
 
     sns.set_style('whitegrid')
@@ -486,12 +598,21 @@ def confidence_fitlering_data_vs_acc_plot(accuracies, dataset_kepts,
 
     ax.legend(frameon=True, loc=3)
     plt.tight_layout()
-    plt.show()
+    visualize_callbacks(callbacks, plt.gcf())
+    if filename:
+        plt.savefig(filename)
+    else:
+        plt.show()
 
 
-def confidence_fitlering_data_vs_acc_multiline_plot(accuracies, dataset_kepts,
-                                                    models_names,
-                                                    title=None):
+def confidence_fitlering_data_vs_acc_multiline_plot(
+        accuracies,
+        dataset_kepts,
+        models_names,
+        title=None,
+        filename=None,
+        callbacks=None,
+):
     assert len(accuracies) == len(dataset_kepts)
 
     sns.set_style('whitegrid')
@@ -533,12 +654,23 @@ def confidence_fitlering_data_vs_acc_multiline_plot(accuracies, dataset_kepts,
     legend_elements = [Line2D([0], [0], linewidth=1.0, color=colors[0])]
     ax.legend(legend_elements, models_names)
     plt.tight_layout()
-    plt.show()
+    visualize_callbacks(callbacks, plt.gcf())
+    if filename:
+        plt.savefig(filename)
+    else:
+        plt.show()
 
 
-def confidence_fitlering_3d_plot(thresholds_1, thresholds_2, accuracies,
-                                 dataset_kepts, threshold_fields=None,
-                                 title=None):
+def confidence_fitlering_3d_plot(
+        thresholds_1,
+        thresholds_2,
+        accuracies,
+        dataset_kepts,
+        threshold_output_feature_names=None,
+        title=None,
+        filename=None,
+        callbacks=None,
+):
     assert len(accuracies) == len(dataset_kepts)
     assert len(thresholds_1) == len(thresholds_2)
 
@@ -562,8 +694,8 @@ def confidence_fitlering_3d_plot(thresholds_1, thresholds_2, accuracies,
     ax.grid(which='minor', alpha=0.5)
     ax.grid(which='major', alpha=0.75)
 
-    ax.set_xlabel('{} probability'.format(threshold_fields[0]))
-    ax.set_ylabel('{} probability'.format(threshold_fields[1]))
+    ax.set_xlabel('{} probability'.format(threshold_output_feature_names[0]))
+    ax.set_ylabel('{} probability'.format(threshold_output_feature_names[1]))
 
     ax.set_xlim(np.min(thresholds_1), np.max(thresholds_1))
     ax.set_ylim(np.min(thresholds_2), np.max(thresholds_2))
@@ -603,20 +735,58 @@ def confidence_fitlering_3d_plot(thresholds_1, thresholds_2, accuracies,
     handle_1.set_color(colors[0])
     handle_2.set_color(colors[1])
 
-    handle_1._edgecolors2d = handle_1._edgecolors3d
-    handle_2._edgecolors2d = handle_2._edgecolors3d
+    ### the next block is needed because matplotlib 3.3.3 renamed
+    # _edgecolors3d -> _edgecolor3d
+    # _facecolors3d -> _facecolor3d
+    # but we want to try to keep compatibility with older versions
+    ##### BEGIN COMPATIBILITY BLOCK #####
+    if hasattr(handle_1, '_edgecolors3d'):
+        edgecolor3d = handle_1._edgecolors3d
+    else:
+        edgecolor3d = handle_1._edgecolor3d
+    handle_1._edgecolors2d = edgecolor3d
+    handle_1._edgecolor2d = edgecolor3d
 
-    handle_1._facecolors2d = handle_1._facecolors3d
-    handle_2._facecolors2d = handle_2._facecolors3d
+    if hasattr(handle_2, '_edgecolors3d'):
+        edgecolor3d = handle_2._edgecolors3d
+    else:
+        edgecolor3d = handle_2._edgecolor3d
+    handle_2._edgecolors2d = edgecolor3d
+    handle_2._edgecolor2d = edgecolor3d
+
+    if hasattr(handle_1, '_facecolors3d'):
+        facecolor3d = handle_1._facecolors3d
+    else:
+        facecolor3d = handle_1._facecolor3d
+    handle_1._facecolors2d = facecolor3d
+    handle_1._facecolor2d = facecolor3d
+
+    if hasattr(handle_2, '_facecolors3d'):
+        facecolor3d = handle_2._facecolors3d
+    else:
+        facecolor3d = handle_2._facecolor3d
+    handle_2._facecolors2d = facecolor3d
+    handle_2._facecolor2d = facecolor3d
+    ##### END COMPATIBILITY BLOCK #####
 
     ax.legend(frameon=True, loc=3, handles=[handle_1, handle_2])
 
     plt.tight_layout()
-    plt.show()
+    visualize_callbacks(callbacks, plt.gcf())
+    if filename:
+        plt.savefig(filename)
+    else:
+        plt.show()
 
 
-def threshold_vs_metric_plot(thresholds, scores, algorithm_names=None,
-                             title=None):
+def threshold_vs_metric_plot(
+        thresholds,
+        scores,
+        algorithm_names=None,
+        title=None,
+        filename=None,
+        callbacks=None,
+):
     sns.set_style('whitegrid')
 
     colors = plt.get_cmap('tab10').colors
@@ -653,10 +823,21 @@ def threshold_vs_metric_plot(thresholds, scores, algorithm_names=None,
 
     ax1.legend(frameon=True)
     plt.tight_layout()
-    plt.show()
+    visualize_callbacks(callbacks, plt.gcf())
+    if filename:
+        plt.savefig(filename)
+    else:
+        plt.show()
 
 
-def roc_curves(fpr_tprs, algorithm_names=None, title=None, graded_color=False):
+def roc_curves(
+        fpr_tprs,
+        algorithm_names=None,
+        title=None,
+        graded_color=False,
+        filename=None,
+        callbacks=None,
+):
     sns.set_style('whitegrid')
 
     colors = plt.get_cmap('tab10').colors
@@ -695,11 +876,20 @@ def roc_curves(fpr_tprs, algorithm_names=None, title=None, graded_color=False):
 
     ax.legend(frameon=True)
     plt.tight_layout()
-    plt.show()
+    visualize_callbacks(callbacks, plt.gcf())
+    if filename:
+        plt.savefig(filename)
+    else:
+        plt.show()
 
 
-def calibration_plot(fraction_positives, mean_predicted_values,
-                     algorithm_names=None):
+def calibration_plot(
+        fraction_positives,
+        mean_predicted_values,
+        algorithm_names=None,
+        filename=None,
+        callbacks=None,
+):
     assert len(fraction_positives) == len(mean_predicted_values)
 
     sns.set_style('whitegrid')
@@ -721,9 +911,12 @@ def calibration_plot(fraction_positives, mean_predicted_values,
 
         # sns.tsplot(mean_predicted_values[i], fraction_positives[i], ax=ax1, color=colors[i])
 
+        assert len(mean_predicted_values[i]) == len(fraction_positives[i])
+        order = min(3, len(mean_predicted_values[i]) - 1)
+
         sns.regplot(mean_predicted_values[i], fraction_positives[i],
-                    order=3, x_estimator=np.mean, color=colors[i], marker='o',
-                    scatter_kws={'s': 40},
+                    order=order, x_estimator=np.mean, color=colors[i],
+                    marker='o', scatter_kws={'s': 40},
                     label=algorithm_names[
                         i] if algorithm_names is not None and i < len(
                         algorithm_names) else '')
@@ -739,10 +932,20 @@ def calibration_plot(fraction_positives, mean_predicted_values,
     plt.title('Calibration (reliability curve)')
 
     plt.tight_layout()
-    plt.show()
+    visualize_callbacks(callbacks, plt.gcf())
+    if filename:
+        plt.savefig(filename)
+    else:
+        plt.show()
 
 
-def brier_plot(brier_scores, algorithm_names=None, title=None):
+def brier_plot(
+        brier_scores,
+        algorithm_names=None,
+        title=None,
+        filename=None,
+        callbacks=None,
+):
     sns.set_style('whitegrid')
 
     if title is not None:
@@ -756,7 +959,6 @@ def brier_plot(brier_scores, algorithm_names=None, title=None):
     plt.xlabel('class')
     plt.ylabel('brier')
 
-    x = np.array(range(brier_scores.shape[0]))
     for i in range(brier_scores.shape[1]):
         plt.plot(brier_scores[:, i],
                  label=algorithm_names[
@@ -766,10 +968,19 @@ def brier_plot(brier_scores, algorithm_names=None, title=None):
 
     plt.legend()
     plt.tight_layout()
-    plt.show()
+    visualize_callbacks(callbacks, plt.gcf())
+    if filename:
+        plt.savefig(filename)
+    else:
+        plt.show()
 
 
-def predictions_distribution_plot(probabilities, algorithm_names=None):
+def predictions_distribution_plot(
+        probabilities,
+        algorithm_names=None,
+        filename=None,
+        callbacks=None,
+):
     sns.set_style('whitegrid')
 
     colors = plt.get_cmap('tab10').colors
@@ -795,10 +1006,20 @@ def predictions_distribution_plot(probabilities, algorithm_names=None):
     plt.legend(loc='upper center', ncol=2)
 
     plt.tight_layout()
-    plt.show()
+    visualize_callbacks(callbacks, plt.gcf())
+    if filename:
+        plt.savefig(filename)
+    else:
+        plt.show()
 
 
-def confusion_matrix_plot(confusion_matrix, labels=None, field=None):
+def confusion_matrix_plot(
+        confusion_matrix,
+        labels=None,
+        output_feature_name=None,
+        filename=None,
+        callbacks=None,
+):
     mpl.rcParams.update({'figure.autolayout': True})
     fig, ax = plt.subplots()
 
@@ -815,15 +1036,27 @@ def confusion_matrix_plot(confusion_matrix, labels=None, field=None):
     ax.grid(False)
     ax.tick_params(axis='both', which='both', length=0)
     fig.colorbar(cax, ax=ax, extend='max')
-    ax.set_xlabel('Predicted {}'.format(field))
-    ax.set_ylabel('Actual {}'.format(field))
+    ax.set_xlabel('Predicted {}'.format(output_feature_name))
+    ax.set_ylabel('Actual {}'.format(output_feature_name))
 
     plt.tight_layout()
-    plt.show()
+    visualize_callbacks(callbacks, plt.gcf())
+    if filename:
+        plt.savefig(filename)
+    else:
+        plt.show()
 
 
-def double_axis_line_plot(y1_sorted, y2, y1_name, y2_name, labels=None,
-                          title=None):
+def double_axis_line_plot(
+        y1_sorted,
+        y2,
+        y1_name,
+        y2_name,
+        labels=None,
+        title=None,
+        filename=None,
+        callbacks=None,
+):
     sns.set_style('whitegrid')
 
     colors = plt.get_cmap('tab10').colors
@@ -843,30 +1076,49 @@ def double_axis_line_plot(y1_sorted, y2, y1_name, y2_name, labels=None,
         ax1.set_xticklabels(labels, rotation=45, ha='right')
         ax1.set_xticks(np.arange(len(labels)))
 
-    ax1.set_ylabel(y2_name, color=colors[1])
+    ax1.set_ylabel(y1_name, color=colors[1])
     ax1.tick_params('y', colors=colors[1])
-    ax1.set_ylim(min(y2), max(y2))
+    ax1.set_ylim(min(y1_sorted), max(y1_sorted))
 
     ax2 = ax1.twinx()
-    ax2.set_ylabel(y1_name, color=colors[0])
+    ax2.set_ylabel(y2_name, color=colors[0])
     ax2.tick_params('y', colors=colors[0])
-    ax2.set_ylim(min(y1_sorted), max(y1_sorted))
+    ax2.set_ylim(min(y2), max(y2))
 
-    ax1.plot(y2, label=y2_name, color=colors[1],
+    ax1.plot(y1_sorted, label=y1_name, color=colors[1],
+             linewidth=4)
+    ax2.plot(y2, label=y2_name, color=colors[0],
              linewidth=3)
-    ax2.plot(y1_sorted, label=y1_name, color=colors[0],
-             linewidth=4.0)
 
     fig.tight_layout()
-    plt.show()
+    visualize_callbacks(callbacks, plt.gcf())
+    if filename:
+        plt.savefig(filename)
+    else:
+        plt.show()
 
 
-def plot_matrix(matrix, cmap='hot'):
+def plot_matrix(
+        matrix,
+        cmap='hot',
+        filename=None,
+        callbacks=None,
+):
     plt.matshow(matrix, cmap=cmap)
-    plt.show()
+    visualize_callbacks(callbacks, plt.gcf())
+    if filename:
+        plt.savefig(filename)
+    else:
+        plt.show()
 
 
-def plot_distributions(distributions, labels=None, title=None):
+def plot_distributions(
+        distributions,
+        labels=None,
+        title=None,
+        filename=None,
+        callbacks=None,
+):
     sns.set_style('whitegrid')
 
     colors = plt.get_cmap('tab10').colors
@@ -892,10 +1144,20 @@ def plot_distributions(distributions, labels=None, title=None):
 
     ax1.legend(frameon=True)
     fig.tight_layout()
-    plt.show()
+    visualize_callbacks(callbacks, plt.gcf())
+    if filename:
+        plt.savefig(filename)
+    else:
+        plt.show()
 
 
-def plot_distributions_difference(distribution, labels=None, title=None):
+def plot_distributions_difference(
+        distribution,
+        labels=None,
+        title=None,
+        filename=None,
+        callbacks=None,
+):
     sns.set_style('whitegrid')
 
     colors = plt.get_cmap('tab10').colors
@@ -917,10 +1179,22 @@ def plot_distributions_difference(distribution, labels=None, title=None):
     ax1.plot(distribution, color=colors[0])
 
     fig.tight_layout()
-    plt.show()
+    visualize_callbacks(callbacks, plt.gcf())
+    if filename:
+        plt.savefig(filename)
+    else:
+        plt.show()
 
 
-def bar_plot(xs, ys, decimals=4, labels=None, title=None):
+def bar_plot(
+        xs,
+        ys,
+        decimals=4,
+        labels=None,
+        title=None,
+        filename=None,
+        callbacks=None,
+):
     assert len(xs) == len(ys)
     assert len(xs) > 0
 
@@ -964,4 +1238,210 @@ def bar_plot(xs, ys, decimals=4, labels=None, title=None):
             [PathEffects.withStroke(linewidth=3, foreground='black')])
 
     plt.tight_layout()
-    plt.show()
+    visualize_callbacks(callbacks, plt.gcf())
+    if filename:
+        plt.savefig(filename)
+    else:
+        plt.show()
+
+
+def hyperopt_report(
+        hyperparameters,
+        hyperopt_results_df,
+        metric,
+        filename_template,
+        float_precision=3
+):
+    title = "Hyperopt Report: {}"
+    for hp_name, hp_params in hyperparameters.items():
+        if hp_params[TYPE] == 'int':
+            hyperopt_int_plot(
+                hyperopt_results_df,
+                hp_name,
+                metric,
+                title.format(hp_name),
+                filename_template.format(
+                    hp_name) if filename_template else None
+            )
+        elif hp_params[TYPE] == 'float':
+            hyperopt_float_plot(
+                hyperopt_results_df,
+                hp_name,
+                metric,
+                title.format(hp_name),
+                filename_template.format(
+                    hp_name) if filename_template else None,
+                log_scale_x=hp_params[
+                                'scale'] == 'log' if 'scale' in hp_params else False
+            )
+        elif hp_params[TYPE] == 'category':
+            hyperopt_category_plot(
+                hyperopt_results_df,
+                hp_name,
+                metric,
+                title.format(hp_name),
+                filename_template.format(
+                    hp_name) if filename_template else None
+            )
+
+    # quantize float and int columns
+    for hp_name, hp_params in hyperparameters.items():
+        if hp_params[TYPE] == 'int':
+            num_distinct_values = len(hyperopt_results_df[hp_name].unique())
+            if num_distinct_values > INT_QUANTILES:
+                hyperopt_results_df[hp_name] = pd.qcut(
+                    hyperopt_results_df[hp_name],
+                    q=INT_QUANTILES,
+                    precision=0
+                )
+        elif hp_params[TYPE] == 'float':
+            hyperopt_results_df[hp_name] = pd.qcut(
+                hyperopt_results_df[hp_name],
+                q=FLOAT_QUANTILES,
+                precision=float_precision,
+                duplicates='drop',
+            )
+
+    hyperopt_pair_plot(
+        hyperopt_results_df,
+        metric,
+        title.format("pair plot"),
+        filename_template.format('pair_plot') if filename_template else None
+    )
+
+
+def hyperopt_int_plot(
+        hyperopt_results_df,
+        hp_name,
+        metric,
+        title,
+        filename,
+        log_scale_x=False,
+        log_scale_y=True
+):
+    sns.set_style('whitegrid')
+    plt.figure()
+    seaborn_figure = sns.scatterplot(
+        x=hp_name,
+        y=metric,
+        data=hyperopt_results_df
+    )
+    seaborn_figure.set_title(title)
+    if log_scale_x:
+        seaborn_figure.set(xscale="log")
+    if log_scale_y:
+        seaborn_figure.set(yscale="log")
+    seaborn_figure.xaxis.set_major_locator(ticker.MaxNLocator(integer=True))
+    seaborn_figure.xaxis.set_major_formatter(ticker.ScalarFormatter())
+    seaborn_figure.xaxis.set_minor_formatter(ticker.NullFormatter())
+    seaborn_figure.figure.tight_layout()
+    if filename:
+        seaborn_figure.figure.savefig(filename)
+    else:
+        seaborn_figure.figure.show()
+
+
+def hyperopt_float_plot(
+        hyperopt_results_df,
+        hp_name,
+        metric,
+        title,
+        filename,
+        log_scale_x=False,
+        log_scale_y=True
+):
+    sns.set_style('whitegrid')
+    plt.figure()
+    seaborn_figure = sns.scatterplot(
+        x=hp_name,
+        y=metric,
+        data=hyperopt_results_df
+    )
+    seaborn_figure.set_title(title)
+    seaborn_figure.set(ylabel=metric)
+    if log_scale_x:
+        seaborn_figure.set(xscale="log")
+    if log_scale_y:
+        seaborn_figure.set(yscale="log")
+    seaborn_figure.figure.tight_layout()
+    if filename:
+        seaborn_figure.figure.savefig(filename)
+    else:
+        seaborn_figure.figure.show()
+
+
+def hyperopt_category_plot(
+        hyperopt_results_df,
+        hp_name,
+        metric,
+        title,
+        filename,
+        log_scale=True
+):
+    sns.set_style('whitegrid')
+    plt.figure()
+    seaborn_figure = sns.violinplot(
+        x=hp_name,
+        y=metric,
+        data=hyperopt_results_df,
+        fit_reg=False
+    )
+    seaborn_figure.set_title(title)
+    seaborn_figure.set(ylabel=metric)
+    sns.despine()
+    if log_scale:
+        seaborn_figure.set(yscale="log")
+    plt.tight_layout()
+    if filename:
+        plt.savefig(filename)
+    else:
+        plt.show()
+
+
+def hyperopt_pair_plot(
+        hyperopt_results_df,
+        metric,
+        title,
+        filename
+):
+    params = sorted(list(hyperopt_results_df.keys()))
+    params.remove(metric)
+    num_param = len(params)
+
+    sns.set_style('white')
+    fig = plt.figure(figsize=(20, 20))
+    fig.suptitle(title)
+    gs = fig.add_gridspec(num_param, num_param)
+
+    for i, param1 in enumerate(params):
+        for j, param2 in enumerate(params):
+            if i != j:
+                ax = fig.add_subplot(gs[i, j])
+                heatmap = hyperopt_results_df.pivot_table(
+                    index=param1,
+                    columns=param2,
+                    values=metric,
+                    aggfunc='mean'
+                )
+                sns.heatmap(
+                    heatmap,
+                    linewidths=1,
+                    cmap="viridis",
+                    cbar_kws={'label': metric},
+                    ax=ax,
+                )
+
+    plt.tight_layout(pad=5)
+    if filename:
+        plt.savefig(filename)
+    else:
+        plt.show()
+
+
+def hyperopt_hiplot(
+        hyperopt_df,
+        filename,
+):
+    import hiplot as hip
+    experiment = hip.Experiment.from_dataframe(hyperopt_df)
+    experiment.to_html(filename)

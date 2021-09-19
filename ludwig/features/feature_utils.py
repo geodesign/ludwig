@@ -14,13 +14,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+import re
+
 import numpy as np
 
-from ludwig.constants import SEQUENCE
+from ludwig.constants import SEQUENCE, PREPROCESSING, NAME
 from ludwig.constants import TEXT
 from ludwig.constants import TIMESERIES
+from ludwig.utils.misc_utils import hash_dict
 from ludwig.utils.strings_utils import UNKNOWN_SYMBOL
-from ludwig.utils.strings_utils import format_registry
+from ludwig.utils.strings_utils import tokenizer_registry
 
 SEQUENCE_TYPES = {SEQUENCE, TEXT, TIMESERIES}
 
@@ -35,13 +38,23 @@ def should_regularize(regularize_layers):
     return regularize
 
 
-def set_str_to_idx(set_string, feature_dict, format_func):
+def set_str_to_idx(set_string, feature_dict, tokenizer_name):
     try:
-        format_function = format_registry[format_func]
+        tokenizer = tokenizer_registry[tokenizer_name]()
     except ValueError:
-        raise Exception('Format {} not supported'.format(format_func))
+        raise Exception('Tokenizer {} not supported'.format(tokenizer_name))
 
     out = [feature_dict.get(item, feature_dict[UNKNOWN_SYMBOL]) for item in
-           format_function(set_string)]
+           tokenizer(set_string)]
 
     return np.array(out, dtype=np.int32)
+
+
+def sanitize(name):
+    """Replaces invalid id characters."""
+    return re.sub('\W|^(?=\d)', '_', name)
+
+
+def compute_feature_hash(feature: dict) -> str:
+    preproc_hash = hash_dict(feature.get(PREPROCESSING, {}))
+    return sanitize(feature[NAME]) + "_" + preproc_hash.decode('ascii')

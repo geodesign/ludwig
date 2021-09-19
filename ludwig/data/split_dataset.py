@@ -19,7 +19,8 @@ import random
 
 
 def split(input_path, output1, output2, split):
-    lines = open(input_path, 'r').readlines()
+    with open(input_path, 'r') as file:
+        lines = file.readlines()
 
     random.shuffle(lines)
     split_idx = int(len(lines) * split)
@@ -40,7 +41,8 @@ if __name__ == '__main__':
         description='Split a file based on its lines'
     )
 
-    parser.add_argument('-i', '--input', required=True, help='input file names')
+    parser.add_argument('-i', '--input', required=True,
+                        help='input file names')
     parser.add_argument(
         '-o1',
         '--output1',

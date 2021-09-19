@@ -16,6 +16,10 @@
 # ==============================================================================
 import logging
 
+from ludwig.constants import TIED
+
+logger = logging.getLogger(__name__)
+
 
 def topological_sort(graph_unsorted):
     """
@@ -80,8 +84,8 @@ def topological_sort_feature_dependencies(features):
         dependencies = []
         if 'dependencies' in feature:
             dependencies.extend(feature['dependencies'])
-        if 'tied_weights' in feature:
-            dependencies.append(feature['tied_weights'])
+        if TIED in feature:
+            dependencies.append(feature[TIED])
         dependencies_graph[feature['name']] = dependencies
         output_features_dict[feature['name']] = feature
     return [output_features_dict[node[0]]
@@ -97,8 +101,8 @@ if __name__ == '__main__':
                       (10, []),
                       (8, [9]),
                       (3, [10, 8])]
-    logging.info(topological_sort(graph_unsorted))
+    logger.info(topological_sort(graph_unsorted))
     graph_unsorted = [('macro', ['action', 'contact_type']),
                       ('contact_type', None),
                       ('action', ['contact_type'])]
-    logging.info(topological_sort(graph_unsorted))
+    logger.info(topological_sort(graph_unsorted))

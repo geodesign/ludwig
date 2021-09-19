@@ -15,35 +15,46 @@
 # limitations under the License.
 # ==============================================================================
 import logging
-import os
-from collections import OrderedDict
+from collections.abc import Iterable
 
 import numpy as np
+import pandas as pd
 import tensorflow as tf
+try:
+    import dask.dataframe as dd
+except ImportError:
+    pass
 
 from ludwig.constants import *
-from ludwig.features.base_feature import BaseFeature
+from ludwig.encoders.text_encoders import ENCODER_REGISTRY
 from ludwig.features.sequence_feature import SequenceInputFeature
 from ludwig.features.sequence_feature import SequenceOutputFeature
 from ludwig.utils.math_utils import softmax
 from ludwig.utils.metrics_utils import ConfusionMatrix
-from ludwig.utils.misc import set_default_value
+from ludwig.utils.misc_utils import get_from_registry
+from ludwig.utils.misc_utils import set_default_value
+from ludwig.utils.misc_utils import set_default_values
 from ludwig.utils.strings_utils import PADDING_SYMBOL
 from ludwig.utils.strings_utils import UNKNOWN_SYMBOL
 from ludwig.utils.strings_utils import build_sequence_matrix
 from ludwig.utils.strings_utils import create_vocabulary
+from ludwig.utils.strings_utils import tokenizer_registry
 
 
-class TextBaseFeature(BaseFeature):
-    def __init__(self, feature):
-        super().__init__(feature)
-        self.type = TEXT
+logger = logging.getLogger(__name__)
+
+
+class TextFeatureMixin:
+    type = TEXT
 
     preprocessing_defaults = {
-        'char_format': 'characters',
+        'char_tokenizer': 'characters',
+        'char_vocab_file': None,
         'char_sequence_length_limit': 1024,
         'char_most_common': 70,
-        'word_format': 'space_punct',
+        'word_tokenizer': 'space_punct',
+        'pretrained_model_name_or_path': None,
+        'word_vocab_file': None,
         'word_sequence_length_limit': 256,
         'word_most_common': 20000,
         'padding_symbol': PADDING_SYMBOL,
@@ -51,62 +62,111 @@ class TextBaseFeature(BaseFeature):
         'padding': 'right',
         'lowercase': True,
         'missing_value_strategy': FILL_WITH_CONST,
-        'fill_value': ''
+        'fill_value': UNKNOWN_SYMBOL
+    }
+
+    preprocessing_schema = {
+        'char_tokenizer': {'type': 'string', 'enum': sorted(list(tokenizer_registry.keys()))},
+        'char_vocab_file': {'type': 'string'},
+        'char_sequence_length_limit': {'type': 'integer', 'minimum': 0},
+        'char_most_common': {'type': 'integer', 'minimum': 0},
+        'word_tokenizer': {'type': 'string', 'enum': sorted(list(tokenizer_registry.keys()))},
+        'pretrained_model_name_or_path': {'type': 'string'},
+        'word_vocab_file': {'type': 'string'},
+        'word_sequence_length_limit': {'type': 'integer', 'minimum': 0},
+        'word_most_common': {'type': 'integer', 'minimum': 0},
+        'padding_symbol': {'type': 'string'},
+        'unknown_symbol': {'type': 'string'},
+        'padding': {'type': 'string', 'enum': ['right', 'left']},
+        'lowercase': {'type': 'boolean'},
+        'missing_value_strategy': {'type': 'string', 'enum': MISSING_VALUE_STRATEGY_OPTIONS},
+        'fill_value': {'type': 'string'},
+        'computed_fill_value': {'type': 'string'},
     }
 
     @staticmethod
-    def feature_meta(column, most_common_characters, most_common_words,
-                     lowercase):
+    def cast_column(column, backend):
+        return column
+
+    @staticmethod
+    def feature_meta(column, preprocessing_parameters, backend):
         (
             char_idx2str,
             char_str2idx,
             char_str2freq,
-            char_max_len
+            char_max_len,
+            char_pad_idx,
+            char_pad_symbol,
+            char_unk_symbol,
         ) = create_vocabulary(
             column,
-            'characters',
-            num_most_frequent=most_common_characters,
-            lowercase=lowercase
+            tokenizer_type='characters',
+            num_most_frequent=preprocessing_parameters['char_most_common'],
+            lowercase=preprocessing_parameters['lowercase'],
+            unknown_symbol=preprocessing_parameters['unknown_symbol'],
+            padding_symbol=preprocessing_parameters['padding_symbol'],
+            pretrained_model_name_or_path=preprocessing_parameters[
+                'pretrained_model_name_or_path'],
+            processor=backend.df_engine
         )
         (
             word_idx2str,
             word_str2idx,
             word_str2freq,
-            word_max_len
+            word_max_len,
+            word_pad_idx,
+            word_pad_symbol,
+            word_unk_symbol,
         ) = create_vocabulary(
             column,
-            'english_tokenize',
-            num_most_frequent=most_common_words,
-            lowercase=lowercase
+            tokenizer_type=preprocessing_parameters['word_tokenizer'],
+            num_most_frequent=preprocessing_parameters['word_most_common'],
+            lowercase=preprocessing_parameters['lowercase'],
+            vocab_file=preprocessing_parameters['word_vocab_file'],
+            unknown_symbol=preprocessing_parameters['unknown_symbol'],
+            padding_symbol=preprocessing_parameters['padding_symbol'],
+            pretrained_model_name_or_path=preprocessing_parameters[
+                'pretrained_model_name_or_path'],
+            processor=backend.df_engine
         )
         return (
             char_idx2str,
             char_str2idx,
             char_str2freq,
             char_max_len,
+            char_pad_idx,
+            char_pad_symbol,
+            char_unk_symbol,
             word_idx2str,
             word_str2idx,
             word_str2freq,
-            word_max_len
+            word_max_len,
+            word_pad_idx,
+            word_pad_symbol,
+            word_unk_symbol,
         )
 
     @staticmethod
-    def get_feature_meta(column, preprocessing_parameters):
-        tf_meta = TextBaseFeature.feature_meta(
-            column,
-            preprocessing_parameters['char_most_common'],
-            preprocessing_parameters['word_most_common'],
-            preprocessing_parameters['lowercase']
+    def get_feature_meta(column, preprocessing_parameters, backend):
+        column = column.astype(str)
+        tf_meta = TextFeatureMixin.feature_meta(
+            column, preprocessing_parameters, backend
         )
         (
             char_idx2str,
             char_str2idx,
             char_str2freq,
             char_max_len,
+            char_pad_idx,
+            char_pad_symbol,
+            char_unk_symbol,
             word_idx2str,
             word_str2idx,
             word_str2freq,
-            word_max_len
+            word_max_len,
+            word_pad_idx,
+            word_pad_symbol,
+            word_unk_symbol,
         ) = tf_meta
         char_max_len = min(
             preprocessing_parameters['char_sequence_length_limit'],
@@ -122,32 +182,54 @@ class TextBaseFeature(BaseFeature):
             'char_str2freq': char_str2freq,
             'char_vocab_size': len(char_idx2str),
             'char_max_sequence_length': char_max_len,
+            'char_pad_idx': char_pad_idx,
+            'char_pad_symbol': char_pad_symbol,
+            'char_unk_symbol': char_unk_symbol,
             'word_idx2str': word_idx2str,
             'word_str2idx': word_str2idx,
             'word_str2freq': word_str2freq,
             'word_vocab_size': len(word_idx2str),
-            'word_max_sequence_length': word_max_len
+            'word_max_sequence_length': word_max_len,
+            'word_pad_idx': word_pad_idx,
+            'word_pad_symbol': word_pad_symbol,
+            'word_unk_symbol': word_unk_symbol,
         }
 
     @staticmethod
-    def feature_data(column, metadata, preprocessing_parameters):
+    def feature_data(column, metadata, preprocessing_parameters, backend):
         char_data = build_sequence_matrix(
-            column,
-            metadata['char_str2idx'],
-            preprocessing_parameters['char_format'],
-            metadata['char_max_sequence_length'],
-            preprocessing_parameters['padding_symbol'],
-            preprocessing_parameters['padding'],
-            preprocessing_parameters['lowercase']
+            sequences=column,
+            inverse_vocabulary=metadata['char_str2idx'],
+            tokenizer_type=preprocessing_parameters['char_tokenizer'],
+            length_limit=metadata['char_max_sequence_length'],
+            padding_symbol=metadata['char_pad_symbol'],
+            padding=preprocessing_parameters['padding'],
+            unknown_symbol=metadata['char_unk_symbol'],
+            lowercase=preprocessing_parameters['lowercase'],
+            tokenizer_vocab_file=preprocessing_parameters[
+                'char_vocab_file'
+            ],
+            pretrained_model_name_or_path=preprocessing_parameters[
+                'pretrained_model_name_or_path'
+            ],
+            processor=backend.df_engine
         )
         word_data = build_sequence_matrix(
-            column,
-            metadata['word_str2idx'],
-            preprocessing_parameters['word_format'],
-            metadata['word_max_sequence_length'],
-            preprocessing_parameters['padding_symbol'],
-            preprocessing_parameters['padding'],
-            preprocessing_parameters['lowercase']
+            sequences=column,
+            inverse_vocabulary=metadata['word_str2idx'],
+            tokenizer_type=preprocessing_parameters['word_tokenizer'],
+            length_limit=metadata['word_max_sequence_length'],
+            padding_symbol=metadata['word_pad_symbol'],
+            padding=preprocessing_parameters['padding'],
+            unknown_symbol=metadata['word_unk_symbol'],
+            lowercase=preprocessing_parameters['lowercase'],
+            tokenizer_vocab_file=preprocessing_parameters[
+                'word_vocab_file'
+            ],
+            pretrained_model_name_or_path=preprocessing_parameters[
+                'pretrained_model_name_or_path'
+            ],
+            processor=backend.df_engine
         )
 
         return char_data, word_data
@@ -155,59 +237,65 @@ class TextBaseFeature(BaseFeature):
     @staticmethod
     def add_feature_data(
             feature,
-            dataset_df,
-            data,
+            input_df,
+            proc_df,
             metadata,
-            preprocessing_parameters
+            preprocessing_parameters,
+            backend,
+            skip_save_processed_input
     ):
-        chars_data, words_data = TextBaseFeature.feature_data(
-            dataset_df[feature['name']].astype(str),
-            metadata[feature['name']], preprocessing_parameters
+        chars_data, words_data = TextFeatureMixin.feature_data(
+            input_df[feature[COLUMN]].astype(str),
+            metadata[feature[NAME]],
+            preprocessing_parameters,
+            backend
         )
-        data['{}_char'.format(feature['name'])] = chars_data
-        data['{}_word'.format(feature['name'])] = words_data
+        proc_df['{}_char'.format(feature[PROC_COLUMN])] = chars_data
+        proc_df['{}_word'.format(feature[PROC_COLUMN])] = words_data
+        return proc_df
 
 
-class TextInputFeature(TextBaseFeature, SequenceInputFeature):
-    def __init__(self, feature):
-        super().__init__(feature)
+class TextInputFeature(TextFeatureMixin, SequenceInputFeature):
+    encoder = 'parallel_cnn'
+    max_sequence_length = None
+    level = 'word'
 
-        self.type = TEXT
+    def __init__(self, feature, encoder_obj=None):
+        super().__init__(feature, encoder_obj=encoder_obj)
+        if 'pad_idx' in feature.keys():
+            self.pad_idx = feature['pad_idx']
+        else:
+            self.pad_idx = None
 
-        self.level = 'word'
-        self.length = 0
+    def call(self, inputs, training=None, mask=None):
+        assert isinstance(inputs, tf.Tensor)
+        assert inputs.dtype == tf.int8 or inputs.dtype == tf.int16 or \
+               inputs.dtype == tf.int32 or inputs.dtype == tf.int64
+        assert len(inputs.shape) == 2
 
-        self.encoder = 'parallel_cnn'
+        inputs_exp = tf.cast(inputs, dtype=tf.int32)
 
-        encoder_parameters = self.overwrite_defaults(feature)
-        self.encoder_obj = self.get_sequence_encoder(encoder_parameters)
-
-    def _get_input_placeholder(self):
-        return tf.placeholder(
-            tf.int32, shape=[None, None],
-            name='{}_placeholder'.format(self.name)
+        if self.pad_idx is not None:
+            inputs_mask = tf.not_equal(inputs, self.pad_idx)
+        else:
+            inputs_mask = None
+        lengths = tf.reduce_sum(tf.cast(inputs_mask, dtype=tf.int32), axis=1)
+        encoder_output = self.encoder_obj(
+            inputs_exp, training=training, mask=inputs_mask
         )
 
-    def build_input(
-            self,
-            regularizer,
-            dropout_rate,
-            is_training=False,
-            **kwargs
-    ):
-        placeholder = self._get_input_placeholder()
-        logging.debug('  targets_placeholder: {0}'.format(placeholder))
+        encoder_output[LENGTHS] = lengths
+        return encoder_output
 
-        return self.build_sequence_input(
-            placeholder,
-            self.encoder_obj,
-            regularizer,
-            dropout_rate,
-            is_training
-        )
+    @classmethod
+    def get_input_dtype(cls):
+        return tf.int32
+
+    def get_input_shape(self):
+        return None,
 
     @staticmethod
-    def update_model_definition_with_metadata(
+    def update_config_with_metadata(
             input_feature,
             feature_metadata,
             *args,
@@ -216,122 +304,65 @@ class TextInputFeature(TextBaseFeature, SequenceInputFeature):
         input_feature['vocab'] = (
             feature_metadata[input_feature['level'] + '_idx2str']
         )
-        input_feature['length'] = (
+        input_feature['max_sequence_length'] = (
             feature_metadata[input_feature['level'] + '_max_sequence_length']
+        )
+        input_feature['pad_idx'] = (
+            feature_metadata[input_feature['level'] + '_pad_idx']
+        )
+        input_feature['num_tokens'] = (
+            len(feature_metadata[input_feature['level'] + '_idx2str'])
         )
 
     @staticmethod
     def populate_defaults(input_feature):
-        set_default_value(input_feature, 'tied_weights', None)
-        set_default_value(input_feature, 'encoder', 'parallel_cnn')
-        set_default_value(input_feature, 'level', 'word')
+        set_default_values(
+            input_feature,
+            {
+                TIED: None,
+                'encoder': 'parallel_cnn',
+                'level': 'word'
+            }
+        )
+
+        encoder_class = get_from_registry(
+            input_feature['encoder'],
+            TextInputFeature.encoder_registry
+        )
+
+        if hasattr(encoder_class, 'default_params'):
+            set_default_values(
+                input_feature,
+                encoder_class.default_params
+            )
+
+    encoder_registry = ENCODER_REGISTRY
 
 
-class TextOutputFeature(TextBaseFeature, SequenceOutputFeature):
+class TextOutputFeature(TextFeatureMixin, SequenceOutputFeature):
+    loss = {TYPE: SOFTMAX_CROSS_ENTROPY}
+    metric_functions = {LOSS: None, TOKEN_ACCURACY: None, LAST_ACCURACY: None,
+                        PERPLEXITY: None, EDIT_DISTANCE: None}
+    default_validation_metric = LOSS
+    max_sequence_length = 0
+    num_classes = 0
+    level = 'word'
+
     def __init__(self, feature):
         super().__init__(feature)
-        self.type = TEXT
 
-        self.level = 'word'
-        self.decoder = 'generator'
-        self.max_sequence_length = 0
-        self.loss = {
-            'type': SOFTMAX_CROSS_ENTROPY,
-            'class_weights': 1,
-            'class_similarities_temperature': 0,
-            'weight': 1
-        }
-        self.num_classes = 0
+    @classmethod
+    def get_output_dtype(cls):
+        return tf.int32
 
-        a = self.overwrite_defaults(feature)
+    def get_output_shape(self):
+        return self.max_sequence_length,
 
-        self.decoder_obj = self.get_sequence_decoder(feature)
-
-    def _get_output_placeholder(self):
-        return tf.placeholder(
-            tf.int32,
-            [None, self.max_sequence_length],
-            name='{}_placeholder'.format(self.name)
-        )
-
-    def build_output(
-            self,
-            hidden,
-            hidden_size,
-            regularizer=None,
-            **kwargs
-    ):
-        train_mean_loss, eval_loss, output_tensors = self.build_sequence_output(
-            self._get_output_placeholder(),
-            self.decoder_obj,
-            hidden,
-            hidden_size,
-            regularizer=regularizer,
-            kwarg=kwargs
-        )
-        return train_mean_loss, eval_loss, output_tensors
-
-    default_validation_measure = LOSS
-
-    output_config = OrderedDict([
-        (LOSS, {
-            'output': EVAL_LOSS,
-            'aggregation': SUM,
-            'value': 0,
-            'type': MEASURE
-        }),
-        (ACCURACY, {
-            'output': CORRECT_ROWWISE_PREDICTIONS,
-            'aggregation': SUM,
-            'value': 0,
-            'type': MEASURE
-        }),
-        (OVERALL_ACCURACY, {
-            'output': CORRECT_OVERALL_PREDICTIONS,
-            'aggregation': SEQ_SUM,
-            'value': 0,
-            'type': MEASURE
-        }),
-        (LAST_ACCURACY, {
-            'output': CORRECT_LAST_PREDICTIONS,
-            'aggregation': SUM,
-            'value': 0,
-            'type': MEASURE
-        }),
-        (PERPLEXITY, {
-            'output': PERPLEXITY,
-            'aggregation': SUM,
-            'value': 0,
-            'type': MEASURE
-        }),
-        (EDIT_DISTANCE, {
-            'output': EDIT_DISTANCE,
-            'aggregation': SUM,
-            'value': 0,
-            'type': MEASURE
-        }),
-        (LAST_PREDICTIONS, {
-            'output': LAST_PREDICTIONS,
-            'aggregation': APPEND,
-            'value': [],
-            'type': PREDICTION
-        }),
-        (PREDICTIONS, {
-            'output': PREDICTIONS,
-            'aggregation': APPEND,
-            'value': [],
-            'type': PREDICTION
-        }),
-        (LENGTHS, {
-            'output': LENGTHS,
-            'aggregation': APPEND,
-            'value': [],
-            'type': PREDICTION
-        })
-    ])
+    def overall_statistics_metadata(self):
+        return {'level': self.level}
 
     @staticmethod
-    def update_model_definition_with_metadata(
+    def update_config_with_metadata(
             output_feature,
             feature_metadata,
             *args,
@@ -373,10 +404,10 @@ class TextOutputFeature(TextBaseFeature, SequenceOutputFeature):
                 raise ValueError(
                     'class_similarities_temperature > 0,'
                     'but no class similarities are provided '
-                    'for feature {}'.format(output_feature['name'])
+                    'for feature {}'.format(output_feature[COLUMN])
                 )
 
-        if output_feature[LOSS]['type'] == 'sampled_softmax_cross_entropy':
+        if output_feature[LOSS][TYPE] == 'sampled_softmax_cross_entropy':
             level_str2freq = '{}_str2freq'.format(output_feature['level'])
             level_idx2str = '{}_idx2str'.format(output_feature['level'])
             output_feature[LOSS]['class_counts'] = [
@@ -386,144 +417,111 @@ class TextOutputFeature(TextBaseFeature, SequenceOutputFeature):
 
     @staticmethod
     def calculate_overall_stats(
-            test_stats,
-            output_feature,
-            dataset,
-            train_set_metadata
+            predictions,
+            targets,
+            train_set_metadata,
     ):
-        feature_name = output_feature['name']
-        level_idx2str = '{}_{}'.format(output_feature['level'], 'idx2str')
-        sequences = dataset.get(feature_name)
+        overall_stats = {}
+        level_idx2str = '{}_{}'.format(train_set_metadata['level'], 'idx2str')
+
+        sequences = targets
         last_elem_sequence = sequences[np.arange(sequences.shape[0]),
                                        (sequences != 0).cumsum(1).argmax(1)]
-        stats = test_stats[feature_name]
         confusion_matrix = ConfusionMatrix(
             last_elem_sequence,
-            stats[LAST_PREDICTIONS],
-            labels=train_set_metadata[feature_name][level_idx2str]
+            predictions[LAST_PREDICTIONS],
+            labels=train_set_metadata[level_idx2str]
         )
-        stats['confusion_matrix'] = confusion_matrix.cm.tolist()
-        stats['overall_stats'] = confusion_matrix.stats()
-        stats['per_class_stats'] = confusion_matrix.per_class_stats()
+        overall_stats['confusion_matrix'] = confusion_matrix.cm.tolist()
+        overall_stats['overall_stats'] = confusion_matrix.stats()
+        overall_stats['per_class_stats'] = confusion_matrix.per_class_stats()
 
-    @staticmethod
-    def postprocess_results(
-            output_feature,
+        return overall_stats
+
+    def postprocess_predictions(
+            self,
             result,
             metadata,
-            experiment_dir_name,
-            skip_save_unprocessed_output=False
+            output_directory,
+            backend,
     ):
-        postprocessed = {}
-        npy_filename = os.path.join(experiment_dir_name, '{}_{}.npy')
-        name = output_feature['name']
-        level_idx2str = '{}_{}'.format(output_feature['level'], 'idx2str')
+        # todo: refactor to reuse SequenceOutputFeature.postprocess_predictions
+        level_idx2str = '{}_{}'.format(self.level, 'idx2str')
 
-        if PREDICTIONS in result and len(result[PREDICTIONS]) > 0:
-            preds = result[PREDICTIONS]
+        predictions_col = f'{self.feature_name}_{PREDICTIONS}'
+        if predictions_col in result:
             if level_idx2str in metadata:
-                postprocessed[PREDICTIONS] = [
-                    [metadata[level_idx2str][token] for token in pred]
-                    for pred in preds
-                ]
-            else:
-                postprocessed[PREDICTIONS] = preds
+                def idx2str(pred):
+                    return [
+                        metadata[level_idx2str][token]
+                        if token < len(metadata[level_idx2str])
+                        else UNKNOWN_SYMBOL
+                        for token in pred
+                    ]
 
-            if not skip_save_unprocessed_output:
-                np.save(npy_filename.format(name, PREDICTIONS), preds)
+                result[predictions_col] = backend.df_engine.map_objects(
+                    result[predictions_col],
+                    idx2str
+                )
 
-            del result[PREDICTIONS]
-
-        if LAST_PREDICTIONS in result and len(result[LAST_PREDICTIONS]) > 0:
-            last_preds = result[LAST_PREDICTIONS]
+        last_preds_col = f'{self.feature_name}_{LAST_PREDICTIONS}'
+        if last_preds_col in result:
             if level_idx2str in metadata:
-                postprocessed[LAST_PREDICTIONS] = [
-                    metadata[level_idx2str][last_pred] for last_pred in
-                    last_preds
-                ]
-            else:
-                postprocessed[LAST_PREDICTIONS] = last_preds
+                def last_idx2str(last_pred):
+                    if last_pred < len(metadata[level_idx2str]):
+                        return metadata[level_idx2str][last_pred]
+                    return UNKNOWN_SYMBOL
 
-            if not skip_save_unprocessed_output:
-                np.save(npy_filename.format(name, LAST_PREDICTIONS), last_preds)
+                result[last_preds_col] = backend.df_engine.map_objects(
+                    result[last_preds_col],
+                    last_idx2str
+                )
 
-            del result[LAST_PREDICTIONS]
-
-        if PROBABILITIES in result and len(result[PROBABILITIES]) > 0:
-            probs = result[PROBABILITIES]
-            if probs is not None:
-
-                if len(probs) > 0 and isinstance(probs[0], list):
-                    prob = []
+        probs_col = f'{self.feature_name}_{PROBABILITIES}'
+        prob_col = f'{self.feature_name}_{PROBABILITY}'
+        if probs_col in result:
+            def compute_prob(probs):
+                if isinstance(probs, (list, tuple, np.ndarray)):
                     for i in range(len(probs)):
-                        for j in range(len(probs[i])):
-                            probs[i][j] = np.max(probs[i][j])
-                        prob.append(np.prod(probs[i]))
+                        probs[i] = np.max(probs[i])
+                    return np.prod(probs)
                 else:
-                    probs = np.amax(probs, axis=-1)
-                    prob = np.prod(probs, axis=-1)
+                    return np.prod(probs, axis=-1)
 
-                postprocessed[PROBABILITIES] = probs
-                postprocessed['probability'] = prob
 
-                if not skip_save_unprocessed_output:
-                    np.save(npy_filename.format(name, PROBABILITIES), probs)
-                    np.save(npy_filename.format(name, 'probability'), prob)
+            result[prob_col] = backend.df_engine.map_objects(
+                result[probs_col],
+                compute_prob,
+            )
 
-            del result[PROBABILITIES]
+            # commenting probabilities out because usually it is huge:
+            # dataset x length x classes
+            # todo: add a mechanism for letting the user decide to save it
+            # result[probs_col] = backend.df_engine.map_objects(
+            #     result[probs_col],
+            #     lambda prob: np.amax(prob, axis=-1),
+            # )
 
-        if LENGTHS in result:
-            del result[LENGTHS]
+        lengths_col = f'{self.feature_name}_{LENGTHS}'
+        if lengths_col in result:
+            del result[lengths_col]
 
-        return postprocessed
+        return result
 
     @staticmethod
     def populate_defaults(output_feature):
         set_default_value(output_feature, 'level', 'word')
+        SequenceOutputFeature.populate_defaults(output_feature)
 
-        set_default_value(
-            output_feature,
-            LOSS,
-            {
-                'type': 'softmax_cross_entropy',
-                'sampler': None,
-                'negative_samples': 0,
-                'distortion': 1,
-                'labels_smoothing': 0,
-                'class_weights': 1,
-                'robust_lambda': 0,
-                'confidence_penalty': 0,
-                'class_similarities_temperature': 0,
-                'weight': 1
-            }
+    def flatten(self, df: pd.DataFrame) -> pd.DataFrame:
+        probs_col = f'{self.feature_name}_{PROBABILITIES}'
+        df[probs_col] = df[probs_col].apply(lambda x: x.flatten())
+        return df
+
+    def unflatten(self, df: dd.DataFrame) -> dd.DataFrame:
+        probs_col = f'{self.feature_name}_{PROBABILITIES}'
+        df[probs_col] = df[probs_col].apply(
+            lambda x: x.reshape(-1, self.max_sequence_length),
+            meta=(probs_col, 'object')
         )
-        set_default_value(output_feature[LOSS], 'type', 'softmax_cross_entropy')
-        set_default_value(output_feature[LOSS], 'labels_smoothing', 0)
-        set_default_value(output_feature[LOSS], 'class_weights', 1)
-        set_default_value(output_feature[LOSS], 'robust_lambda', 0)
-        set_default_value(output_feature[LOSS], 'confidence_penalty', 0)
-        set_default_value(output_feature[LOSS],
-                          'class_similarities_temperature', 0)
-        set_default_value(output_feature[LOSS], 'weight', 1)
-        set_default_value(output_feature[LOSS], 'type', 'softmax_cross_entropy')
-
-        if output_feature[LOSS]['type'] == 'sampled_softmax_cross_entropy':
-            set_default_value(output_feature[LOSS], 'sampler', 'log_uniform')
-            set_default_value(output_feature[LOSS], 'negative_samples', 25)
-            set_default_value(output_feature[LOSS], 'distortion', 0.75)
-        else:
-            set_default_value(output_feature[LOSS], 'sampler', None)
-            set_default_value(output_feature[LOSS], 'negative_samples', 0)
-            set_default_value(output_feature[LOSS], 'distortion', 1)
-
-        set_default_value(output_feature[LOSS], 'unique', False)
-        set_default_value(output_feature[LOSS], 'weight', 1)
-
-        set_default_value(output_feature, 'decoder', 'generator')
-
-        if output_feature['decoder'] == 'tagger':
-            set_default_value(output_feature, 'reduce_input', None)
-
-        set_default_value(output_feature, 'dependencies', [])
-        set_default_value(output_feature, 'reduce_input', SUM)
-        set_default_value(output_feature, 'reduce_dependencies', SUM)
+        return df

@@ -15,393 +15,341 @@
 # limitations under the License.
 # ==============================================================================
 import logging
-import os
-from collections import OrderedDict
 
 import numpy as np
 import tensorflow as tf
+from tensorflow.keras.metrics import Accuracy as BinaryAccuracy
 
 from ludwig.constants import *
-from ludwig.features.base_feature import BaseFeature
+from ludwig.decoders.generic_decoders import Regressor
+from ludwig.encoders.binary_encoders import ENCODER_REGISTRY
 from ludwig.features.base_feature import InputFeature
 from ludwig.features.base_feature import OutputFeature
-from ludwig.models.modules.initializer_modules import get_initializer
-from ludwig.models.modules.loss_modules import mean_confidence_penalty
-from ludwig.models.modules.measure_modules import accuracy as get_accuracy
+from ludwig.modules.loss_modules import BWCEWLoss
+from ludwig.modules.metric_modules import BWCEWLMetric, ROCAUCMetric
 from ludwig.utils.metrics_utils import ConfusionMatrix
 from ludwig.utils.metrics_utils import average_precision_score
 from ludwig.utils.metrics_utils import precision_recall_curve
 from ludwig.utils.metrics_utils import roc_auc_score
 from ludwig.utils.metrics_utils import roc_curve
-from ludwig.utils.misc import set_default_value
+from ludwig.utils.misc_utils import set_default_value
+from ludwig.utils.misc_utils import set_default_values
+from ludwig.utils import strings_utils
+
+logger = logging.getLogger(__name__)
 
 
-class BinaryBaseFeature(BaseFeature):
-    def __init__(self, feature):
-        super().__init__(feature)
-        self.type = BINARY
-
+class BinaryFeatureMixin:
+    type = BINARY
     preprocessing_defaults = {
-        'missing_value_strategy': FILL_WITH_CONST,
-        'fill_value': 0
+        "missing_value_strategy": FILL_WITH_CONST,
+        "fill_value": 0,
+    }
+
+    fill_value_schema = {
+        "anyOf": [
+            {"type": "integer", "minimum": 0, "maximum": 1},
+            {"type": "string", "enum": strings_utils.all_bool_strs()},
+        ]
+    }
+
+    preprocessing_schema = {
+        "missing_value_strategy": {
+            "type": "string",
+            "enum": MISSING_VALUE_STRATEGY_OPTIONS,
+        },
+        "fill_value": fill_value_schema,
+        "computed_fill_value": fill_value_schema,
     }
 
     @staticmethod
-    def get_feature_meta(column, preprocessing_parameters):
-        return {}
+    def cast_column(column, backend):
+        # todo maybe move code from add_feature_data here
+        #  + figure out what NaN is in a bool column
+        return column
+
+    @staticmethod
+    def get_feature_meta(column, preprocessing_parameters, backend):
+        if column.dtype != object:
+            return {}
+
+        distinct_values = backend.df_engine.compute(column.drop_duplicates())
+        if len(distinct_values) > 2:
+            raise ValueError(
+                f"Binary feature column {column.name} expects 2 distinct values, "
+                f"found: {distinct_values.values.tolist()}"
+            )
+
+        str2bool = {v: strings_utils.str2bool(v) for v in distinct_values}
+        bool2str = [
+            k for k, v in sorted(str2bool.items(), key=lambda item: item[1])
+        ]
+
+        return {
+            "str2bool": str2bool,
+            "bool2str": bool2str,
+        }
 
     @staticmethod
     def add_feature_data(
-            feature,
-            dataset_df,
-            data,
-            metadata,
-            preprocessing_parameters=None
+        feature,
+        input_df,
+        proc_df,
+        metadata,
+        preprocessing_parameters,
+        backend,
+        skip_save_processed_input,
     ):
-        data[feature['name']] = dataset_df[feature['name']].astype(
-            np.bool_).as_matrix()
+        column = input_df[feature[COLUMN]]
+
+        if column.dtype == object:
+            metadata = metadata[feature[NAME]]
+            if "str2bool" in metadata:
+                column = column.map(lambda x: metadata["str2bool"][x])
+            else:
+                # No predefined mapping from string to bool, so compute it directly
+                column = column.map(strings_utils.str2bool)
+
+        proc_df[feature[PROC_COLUMN]] = column.astype(np.bool_).values
+        return proc_df
 
 
-class BinaryInputFeature(BinaryBaseFeature, InputFeature):
-    def __init__(self, feature):
+class BinaryInputFeature(BinaryFeatureMixin, InputFeature):
+    encoder = "passthrough"
+    norm = None
+    dropout = False
+
+    def __init__(self, feature, encoder_obj=None):
         super().__init__(feature)
+        self.overwrite_defaults(feature)
+        if encoder_obj:
+            self.encoder_obj = encoder_obj
+        else:
+            self.encoder_obj = self.initialize_encoder(feature)
 
-        _ = self.overwrite_defaults(feature)
+    def call(self, inputs, training=None, mask=None):
+        assert isinstance(inputs, tf.Tensor)
+        assert inputs.dtype in [tf.bool, tf.int64]
+        assert len(inputs.shape) == 1
 
-    def _get_input_placeholder(self):
-        return tf.placeholder(
-            tf.bool,
-            shape=[None],  # None is for dealing with variable batch size
-            name='{}_placeholder'.format(self.name)
+        inputs = tf.cast(inputs, dtype=tf.float32)
+        inputs_exp = inputs[:, tf.newaxis]
+        encoder_outputs = self.encoder_obj(
+            inputs_exp, training=training, mask=mask
         )
 
-    def build_input(
-            self,
-            regularizer,
-            dropout_rate,
-            is_training=False,
-            **kwargs
-    ):
-        placeholder = self._get_input_placeholder()
-        logging.debug('  placeholder: {0}'.format(placeholder))
+        return encoder_outputs
 
-        feature_representation = tf.expand_dims(
-            tf.cast(placeholder, tf.float32), 1)
+    @classmethod
+    def get_input_dtype(cls):
+        return tf.bool
 
-        logging.debug('  feature_representation: {0}'.format(
-            feature_representation))
-
-        feature_representation = {
-            'name': self.name,
-            'type': self.type,
-            'representation': feature_representation,
-            'size': 1,
-            'placeholder': placeholder
-        }
-        return feature_representation
+    def get_input_shape(self):
+        return ()
 
     @staticmethod
-    def update_model_definition_with_metadata(
-            input_feature,
-            feature_metadata,
-            *args,
-            **kwargs
+    def update_config_with_metadata(
+        input_feature, feature_metadata, *args, **kwargs
     ):
         pass
 
     @staticmethod
     def populate_defaults(input_feature):
-        set_default_value(input_feature, 'tied_weights', None)
+        set_default_value(input_feature, TIED, None)
+
+    encoder_registry = ENCODER_REGISTRY
 
 
-class BinaryOutputFeature(BinaryBaseFeature, OutputFeature):
+class BinaryOutputFeature(BinaryFeatureMixin, OutputFeature):
+    decoder = "regressor"
+    loss = {TYPE: SOFTMAX_CROSS_ENTROPY}
+    metric_functions = {LOSS: None, ACCURACY: None}
+    default_validation_metric = ACCURACY
+    threshold = 0.5
+
     def __init__(self, feature):
         super().__init__(feature)
+        self.overwrite_defaults(feature)
+        self.decoder_obj = self.initialize_decoder(feature)
+        self._setup_loss()
+        self._setup_metrics()
 
-        self.threshold = 0.5
+    def logits(self, inputs, **kwargs):  # hidden
+        hidden = inputs[HIDDEN]
+        return self.decoder_obj(hidden)
 
-        self.initializer = None
-        self.regularize = True
+    def predictions(self, inputs, **kwargs):  # hidden
+        logits = inputs[LOGITS]
 
-        self.loss = {
-            'robust_lambda': 0,
-            'confidence_penalty': 0
+        probabilities = tf.nn.sigmoid(
+            logits, name="probabilities_{}".format(self.name)
+        )
+        predictions = tf.greater_equal(
+            probabilities,
+            self.threshold,
+            name="predictions_{}".format(self.name),
+        )
+
+        return {
+            PROBABILITIES: probabilities,
+            PREDICTIONS: predictions,
+            LOGITS: logits,
         }
 
-        _ = self.overwrite_defaults(feature)
-
-    def _get_output_placeholder(self):
-        return tf.placeholder(
-            tf.bool,
-            [None],  # None is for dealing with variable batch size
-            name='{}_placeholder'.format(self.name)
+    def _setup_loss(self):
+        self.train_loss_function = BWCEWLoss(
+            positive_class_weight=self.loss["positive_class_weight"],
+            robust_lambda=self.loss["robust_lambda"],
+            confidence_penalty=self.loss["confidence_penalty"],
         )
+        self.eval_loss_function = self.train_loss_function
 
-    def _get_predictions(
-            self,
-            hidden,
-            hidden_size,
-            regularizer=None
-    ):
-        if not self.regularize:
-            regularizer = None
-
-        with tf.variable_scope('predictions_{}'.format(self.name)):
-            initializer_obj = get_initializer(self.initializer)
-            weights = tf.get_variable(
-                'weights',
-                initializer=initializer_obj([hidden_size, 1]),
-                regularizer=regularizer
-            )
-            logging.debug('  regression_weights: {0}'.format(weights))
-
-            biases = tf.get_variable('biases', [1])
-            logging.debug('  regression_biases: {0}'.format(biases))
-
-            logits = tf.reshape(tf.matmul(hidden, weights) + biases, [-1])
-            logging.debug('  logits: {0}'.format(logits))
-
-            probabilities = tf.nn.sigmoid(
-                logits,
-                name='probabilities_{}'.format(
-                    self.name)
-            )
-            predictions = tf.greater_equal(
-                probabilities,
-                self.threshold,
-                name='predictions_{}'.format(
-                    self.name)
-            )
-        return predictions, probabilities, logits
-
-    def _get_loss(self, targets, logits, probabilities):
-        with tf.variable_scope('loss_{}'.format(self.name)):
-            train_loss = tf.nn.sigmoid_cross_entropy_with_logits(
-                labels=tf.to_float(targets), logits=logits)
-
-            if self.loss['robust_lambda'] > 0:
-                train_loss = ((1 - self.loss['robust_lambda']) * train_loss +
-                              self.loss['robust_lambda'] / 2)
-
-            train_mean_loss = tf.reduce_mean(
-                train_loss,
-                name='train_mean_loss_{}'.format(
-                    self.name)
-            )
-
-            if self.loss['confidence_penalty'] > 0:
-                mean_penalty = mean_confidence_penalty(probabilities, 2)
-                train_mean_loss += (
-                        self.loss['confidence_penalty'] * mean_penalty
-                )
-
-        return train_mean_loss, train_loss
-
-    def _get_measures(self, targets, predictions):
-        with tf.variable_scope('measures_{}'.format(self.name)):
-            accuracy, correct_predictions = get_accuracy(
-                targets,
-                predictions,
-                self.name
-            )
-        return correct_predictions, accuracy
-
-    def build_output(
-            self,
-            hidden,
-            hidden_size,
-            regularizer=None,
-            **kwargs
-    ):
-        output_tensors = {}
-
-        # ================ Placeholder ================
-        targets = self._get_output_placeholder()
-        logging.debug('  targets_placeholder: {0}'.format(targets))
-        output_tensors[self.name] = targets
-
-        # ================ Predictions ================
-        ppl = self._get_predictions(
-            hidden,
-            hidden_size,
-            regularizer=regularizer
+    def _setup_metrics(self):
+        self.metric_functions = {}  # needed to shadow class variable
+        self.metric_functions[LOSS] = BWCEWLMetric(
+            positive_class_weight=self.loss["positive_class_weight"],
+            robust_lambda=self.loss["robust_lambda"],
+            confidence_penalty=self.loss["confidence_penalty"],
+            name="eval_loss",
         )
-        predictions, probabilities, logits = ppl
-
-        output_tensors[
-            PREDICTIONS + '_' + self.name] = predictions
-        output_tensors[
-            PROBABILITIES + '_' + self.name] = probabilities
-
-        # ================ Measures ================
-        correct_predictions, accuracy = self._get_measures(targets, predictions)
-
-        output_tensors[
-            CORRECT_PREDICTIONS + '_' + self.name] = correct_predictions
-
-        output_tensors[ACCURACY + '_' + self.name] = accuracy
-
-        # ================ Loss (Binary Cross Entropy) ================
-        train_mean_loss, eval_loss = self._get_loss(
-            targets,
-            logits,
-            probabilities
+        self.metric_functions[ACCURACY] = BinaryAccuracy(
+            name="metric_accuracy"
         )
+        self.metric_functions[ROC_AUC] = ROCAUCMetric(name="metric_auc")
 
-        output_tensors[EVAL_LOSS + '_' + self.name] = eval_loss
-        output_tensors[TRAIN_MEAN_LOSS + '_' + self.name] = train_mean_loss
+    def get_prediction_set(self):
+        return {PREDICTIONS, PROBABILITIES, LOGITS}
 
-        tf.summary.scalar(
-            'train_mean_loss_{}'.format(self.name),
-            train_mean_loss
-        )
+    # def update_metrics(self, targets, predictions):
+    #     for metric, metric_fn in self.metric_functions.items():
+    #         if metric == LOSS:
+    #             metric_fn.update_state(targets, predictions[LOGITS])
+    #         else:
+    #             metric_fn.update_state(targets, predictions[PREDICTIONS])
 
-        return train_mean_loss, eval_loss, output_tensors
+    @classmethod
+    def get_output_dtype(cls):
+        return tf.bool
 
-    default_validation_measure = ACCURACY
-
-    output_config = OrderedDict([
-        (LOSS, {
-            'output': EVAL_LOSS,
-            'aggregation': SUM,
-            'value': 0,
-            'type': MEASURE
-        }),
-        (ACCURACY, {
-            'output': CORRECT_PREDICTIONS,
-            'aggregation': SUM,
-            'value': 0,
-            'type': MEASURE
-        }),
-        (PREDICTIONS, {
-            'output': PREDICTIONS,
-            'aggregation': APPEND,
-            'value': [],
-            'type': PREDICTION
-        }),
-        (PROBABILITIES, {
-            'output': PROBABILITIES,
-            'aggregation': APPEND,
-            'value': [],
-            'type': PREDICTION
-        })
-    ])
+    def get_output_shape(self):
+        return ()
 
     @staticmethod
-    def update_model_definition_with_metadata(
-            input_feature,
-            feature_metadata,
-            *args,
-            **kwargs
+    def update_config_with_metadata(
+        input_feature, feature_metadata, *args, **kwargs
     ):
         pass
 
     @staticmethod
-    def calculate_overall_stats(
-            test_stats,
-            output_feature,
-            dataset,
-            train_set_metadata
-    ):
-        feature_name = output_feature['name']
-        stats = test_stats[feature_name]
-
+    def calculate_overall_stats(predictions, targets, train_set_metadata):
+        overall_stats = {}
         confusion_matrix = ConfusionMatrix(
-            dataset.get(feature_name),
-            stats[PREDICTIONS],
-            labels=['False', 'True']
+            targets, predictions[PREDICTIONS], labels=["False", "True"]
         )
-        stats['confusion_matrix'] = confusion_matrix.cm.tolist()
-        stats['overall_stats'] = confusion_matrix.stats()
-        stats['per_class_stats'] = confusion_matrix.per_class_stats()
-        fpr, tpr, thresholds = roc_curve(
-            dataset.get(feature_name),
-            stats[PROBABILITIES]
-        )
-        stats['roc_curve'] = {
-            'false_positive_rate': fpr.tolist(),
-            'true_positive_rate': tpr.tolist()
+        overall_stats["confusion_matrix"] = confusion_matrix.cm.tolist()
+        overall_stats["overall_stats"] = confusion_matrix.stats()
+        overall_stats["per_class_stats"] = confusion_matrix.per_class_stats()
+        fpr, tpr, thresholds = roc_curve(targets, predictions[PROBABILITIES])
+        overall_stats["roc_curve"] = {
+            "false_positive_rate": fpr.tolist(),
+            "true_positive_rate": tpr.tolist(),
         }
-        stats['roc_auc_macro'] = roc_auc_score(
-            dataset.get(feature_name),
-            stats[PROBABILITIES],
-            average='macro'
+        overall_stats["roc_auc_macro"] = roc_auc_score(
+            targets, predictions[PROBABILITIES], average="macro"
         )
-        stats['roc_auc_micro'] = roc_auc_score(
-            dataset.get(feature_name),
-            stats[PROBABILITIES],
-            average='micro'
+        overall_stats["roc_auc_micro"] = roc_auc_score(
+            targets, predictions[PROBABILITIES], average="micro"
         )
         ps, rs, thresholds = precision_recall_curve(
-            dataset.get(feature_name),
-            stats[PROBABILITIES]
+            targets, predictions[PROBABILITIES]
         )
-        stats['precision_recall_curve'] = {
-            'precisions': ps.tolist(),
-            'recalls': rs.tolist()
+        overall_stats["precision_recall_curve"] = {
+            "precisions": ps.tolist(),
+            "recalls": rs.tolist(),
         }
-        stats['average_precision_macro'] = average_precision_score(
-            dataset.get(feature_name),
-            stats[PROBABILITIES],
-            average='macro'
+        overall_stats["average_precision_macro"] = average_precision_score(
+            targets, predictions[PROBABILITIES], average="macro"
         )
-        stats['average_precision_micro'] = average_precision_score(
-            dataset.get(feature_name),
-            stats[PROBABILITIES],
-            average='micro'
+        overall_stats["average_precision_micro"] = average_precision_score(
+            targets, predictions[PROBABILITIES], average="micro"
         )
-        stats['average_precision_samples'] = average_precision_score(
-            dataset.get(feature_name),
-            stats[PROBABILITIES],
-            average='samples'
+        overall_stats["average_precision_samples"] = average_precision_score(
+            targets, predictions[PROBABILITIES], average="samples"
         )
 
-    @staticmethod
-    def postprocess_results(
-            output_feature,
-            result,
-            metadata,
-            experiment_dir_name,
-            skip_save_unprocessed_output=False
+        return overall_stats
+
+    def postprocess_predictions(
+        self,
+        result,
+        metadata,
+        output_directory,
+        backend,
     ):
-        postprocessed = {}
-        npy_filename = os.path.join(experiment_dir_name, '{}_{}.npy')
-        name = output_feature['name']
+        class_names = ["False", "True"]
+        if "bool2str" in metadata:
+            class_names = metadata["bool2str"]
 
-        if PREDICTIONS in result and len(result[PREDICTIONS]) > 0:
-            postprocessed[PREDICTIONS] = result[PREDICTIONS]
-            if not skip_save_unprocessed_output:
-                np.save(
-                    npy_filename.format(name, PREDICTIONS),
-                    result[PREDICTIONS]
+        predictions_col = f"{self.feature_name}_{PREDICTIONS}"
+        if predictions_col in result:
+            if "bool2str" in metadata:
+                result[predictions_col] = backend.df_engine.map_objects(
+                    result[predictions_col],
+                    lambda pred: metadata["bool2str"][pred],
                 )
-            del result[PREDICTIONS]
 
-        if PROBABILITIES in result and len(result[PROBABILITIES]) > 0:
-            postprocessed[PROBABILITIES] = result[PROBABILITIES]
-            if not skip_save_unprocessed_output:
-                np.save(
-                    npy_filename.format(name, PROBABILITIES),
-                    result[PROBABILITIES]
-                )
-            del result[PROBABILITIES]
+        probabilities_col = f"{self.feature_name}_{PROBABILITIES}"
+        if probabilities_col in result:
+            false_col = f"{probabilities_col}_{class_names[0]}"
+            result[false_col] = backend.df_engine.map_objects(
+                result[probabilities_col], lambda prob: 1 - prob
+            )
 
-        return postprocessed
+            true_col = f"{probabilities_col}_{class_names[1]}"
+            result[true_col] = result[probabilities_col]
+
+            prob_col = f"{self.feature_name}_{PROBABILITY}"
+            result[prob_col] = result[[false_col, true_col]].max(axis=1)
+
+            result[probabilities_col] = backend.df_engine.map_objects(
+                result[probabilities_col], lambda prob: [1 - prob, prob]
+            )
+
+        return result
 
     @staticmethod
     def populate_defaults(output_feature):
-        set_default_value(
-            output_feature,
-            LOSS,
+        # If Loss is not defined, set an empty dictionary
+        set_default_value(output_feature, LOSS, {})
+        set_default_values(
+            output_feature[LOSS],
             {
-                'threshold': 0.5,
-                'robust_lambda': 0,
-                'confidence_penalty': 0,
-                'weight': 1
-            }
+                "robust_lambda": 0,
+                "confidence_penalty": 0,
+                "positive_class_weight": 1,
+                "weight": 1,
+            },
         )
-        set_default_value(output_feature, 'threshold', 0.5)
-        set_default_value(output_feature, 'dependencies', [])
-        set_default_value(output_feature, 'weight', 1)
-        set_default_value(output_feature, 'reduce_input', SUM)
-        set_default_value(output_feature, 'reduce_dependencies', SUM)
+
+        set_default_value(output_feature[LOSS], "robust_lambda", 0)
+        set_default_value(output_feature[LOSS], "confidence_penalty", 0)
+        set_default_value(output_feature[LOSS], "positive_class_weight", 1)
+        set_default_value(output_feature[LOSS], "weight", 1)
+
+        set_default_values(
+            output_feature,
+            {
+                "threshold": 0.5,
+                "dependencies": [],
+                "reduce_input": SUM,
+                "reduce_dependencies": SUM,
+            },
+        )
+
+    decoder_registry = {
+        "regressor": Regressor,
+        "null": Regressor,
+        "none": Regressor,
+        "None": Regressor,
+        None: Regressor,
+    }

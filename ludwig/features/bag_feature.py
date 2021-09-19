@@ -21,34 +21,48 @@ import numpy as np
 import tensorflow as tf
 
 from ludwig.constants import *
-from ludwig.features.base_feature import BaseFeature
+from ludwig.encoders.bag_encoders import ENCODER_REGISTRY
 from ludwig.features.base_feature import InputFeature
 from ludwig.features.feature_utils import set_str_to_idx
-from ludwig.models.modules.embedding_modules import EmbedWeighted
-from ludwig.utils.misc import set_default_value
-from ludwig.utils.strings_utils import create_vocabulary
+from ludwig.utils.misc_utils import set_default_value
+from ludwig.utils.strings_utils import create_vocabulary, tokenizer_registry, UNKNOWN_SYMBOL
+
+logger = logging.getLogger(__name__)
 
 
-class BagBaseFeature(BaseFeature):
-    def __init__(self, feature):
-        super().__init__(feature)
-        self.type = BAG
+class BagFeatureMixin:
+    type = BAG
 
     preprocessing_defaults = {
-        'format': 'space',
+        'tokenizer': 'space',
         'most_common': 10000,
         'lowercase': False,
         'missing_value_strategy': FILL_WITH_CONST,
-        'fill_value': ''
+        'fill_value': UNKNOWN_SYMBOL
+    }
+
+    preprocessing_schema = {
+        'tokenizer': {'type': 'string', 'enum': sorted(list(tokenizer_registry.keys()))},
+        'most_common': {'type': 'integer', 'minimum': 0},
+        'lowercase': {'type': 'boolean'},
+        'missing_value_strategy': {'type': 'string', 'enum': MISSING_VALUE_STRATEGY_OPTIONS},
+        'fill_value': {'type': 'string'},
+        'computed_fill_value': {'type': 'string'},
     }
 
     @staticmethod
-    def get_feature_meta(column, preprocessing_parameters):
-        idx2str, str2idx, str2freq, max_size = create_vocabulary(
+    def cast_column(column, backend):
+        return column
+
+    @staticmethod
+    def get_feature_meta(column, preprocessing_parameters, backend):
+        column = column.astype(str)
+        idx2str, str2idx, str2freq, max_size, _, _, _ = create_vocabulary(
             column,
-            preprocessing_parameters['format'],
+            preprocessing_parameters['tokenizer'],
             num_most_frequent=preprocessing_parameters['most_common'],
-            lowercase=preprocessing_parameters['lowercase']
+            lowercase=preprocessing_parameters['lowercase'],
+            processor=backend.df_engine,
         )
         return {
             'idx2str': idx2str,
@@ -59,104 +73,68 @@ class BagBaseFeature(BaseFeature):
         }
 
     @staticmethod
-    def feature_data(column, metadata, preprocessing_parameters):
-        bag_matrix = np.zeros(
-            (len(column),
-             len(metadata['str2idx'])),
-            dtype=float
-        )
-
-        for i in range(len(column)):
+    def feature_data(column, metadata, preprocessing_parameters, backend):
+        def to_vector(set_str):
+            bag_vector = np.zeros((len(metadata['str2idx']),), dtype=np.float32)
             col_counter = Counter(set_str_to_idx(
-                column[i],
+                set_str,
                 metadata['str2idx'],
-                preprocessing_parameters['format'])
+                preprocessing_parameters['tokenizer'])
             )
-            bag_matrix[i, list(col_counter.keys())] = list(col_counter.values())
 
-        return bag_matrix
+            bag_vector[list(col_counter.keys())] = list(col_counter.values())
+            return bag_vector
+
+        return backend.df_engine.map_objects(column, to_vector)
 
     @staticmethod
     def add_feature_data(
             feature,
-            dataset_df,
-            data,
+            input_df,
+            proc_df,
             metadata,
-            preprocessing_parameters=None
+            preprocessing_parameters,
+            backend,
+            skip_save_processed_input
     ):
-        data[feature['name']] = BagBaseFeature.feature_data(
-            dataset_df[feature['name']].astype(str),
-            metadata[feature['name']],
-            preprocessing_parameters
+        proc_df[feature[PROC_COLUMN]] = BagFeatureMixin.feature_data(
+            input_df[feature[COLUMN]].astype(str),
+            metadata[feature[NAME]],
+            preprocessing_parameters,
+            backend
         )
+        return proc_df
 
 
-class BagInputFeature(BagBaseFeature, InputFeature):
-    def __init__(self, feature):
+class BagInputFeature(BagFeatureMixin, InputFeature):
+    encoder = 'embed'
+    vocab = []
+
+    def __init__(self, feature, encoder_obj=None):
         super().__init__(feature)
+        self.overwrite_defaults(feature)
+        if encoder_obj:
+            self.encoder_obj = encoder_obj
+        else:
+            self.encoder_obj = self.initialize_encoder(feature)
 
-        self.vocab = []
+    def call(self, inputs, training=None, mask=None):
+        assert isinstance(inputs, tf.Tensor)
+        # assert inputs.dtype == tf.bool # this fails
 
-        self.embedding_size = 50
-        self.representation = 'dense'
-        self.embeddings_trainable = True
-        self.pretrained_embeddings = None
-        self.embeddings_on_cpu = False
-        self.dropout = False
-        self.initializer = None
-        self.regularize = True
+        encoder_output = self.encoder_obj(inputs, training=training, mask=mask)
 
-        _ = self.overwrite_defaults(feature)
+        return {'encoder_output': encoder_output}
 
-        self.embed_weighted = EmbedWeighted(
-            self.vocab,
-            self.embedding_size,
-            representation=self.representation,
-            embeddings_trainable=self.embeddings_trainable,
-            pretrained_embeddings=self.pretrained_embeddings,
-            embeddings_on_cpu=self.embeddings_on_cpu,
-            dropout=self.dropout,
-            initializer=self.initializer,
-            regularize=self.regularize
-        )
+    @classmethod
+    def get_input_dtype(cls):
+        return tf.float32
 
-    def _get_input_placeholder(self):
-        # None dimension is for dealing with variable batch size
-        return tf.placeholder(
-            tf.float32,
-            shape=[None, len(self.vocab)],
-            name=self.name
-        )
-
-    def build_input(
-            self,
-            regularizer,
-            dropout_rate,
-            is_training=False,
-            **kwargs
-    ):
-        placeholder = self._get_input_placeholder()
-        logging.debug('placeholder: {0}'.format(placeholder))
-
-        embedded, embedding_size = self.embed_weighted(
-            placeholder,
-            regularizer,
-            dropout_rate,
-            is_training=False
-        )
-        logging.debug('feature_representation: {0}'.format(embedded))
-
-        feature_representation = {
-            'name': self.name,
-            'type': self.type,
-            'representation': embedded,
-            'size': embedding_size,
-            'placeholder': placeholder
-        }
-        return feature_representation
+    def get_input_shape(self):
+        return len(self.vocab),
 
     @staticmethod
-    def update_model_definition_with_metadata(
+    def update_config_with_metadata(
             input_feature,
             feature_metadata,
             *args,
@@ -166,4 +144,6 @@ class BagInputFeature(BagBaseFeature, InputFeature):
 
     @staticmethod
     def populate_defaults(input_feature):
-        set_default_value(input_feature, 'tied_weights', None)
+        set_default_value(input_feature, TIED, None)
+
+    encoder_registry = ENCODER_REGISTRY

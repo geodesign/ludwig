@@ -1,16 +1,25 @@
 Cython>=0.25
-h5py>=2.6
-matplotlib>=3.0
+h5py>=2.6,!=3.0.0
 numpy>=1.15
-pandas>=0.19
+pandas>=0.25,!=1.1.5
 scipy>=0.18
-scikit-image==0.14.2
-scikit-learn
-seaborn>=0.7
-spacy>=2.0
-https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-2.0.0/en_core_web_sm-2.0.0.tar.gz
-tqdm
 tabulate>=0.7
-tensorflow==1.13.1
+scikit-learn
+tqdm
+tensorflow>=2.3.1
+tensorflow-addons==0.13.0
 PyYAML>=3.12
-pytest
+absl-py
+kaggle
+requests
+tables
+fsspec
+dataclasses-json
+jsonschema
+
+# new data format support
+xlwt            # excel
+xlrd            # excel
+openpyxl        # excel
+pyarrow         # parquet
+lxml            # html

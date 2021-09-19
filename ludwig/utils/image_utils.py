@@ -14,14 +14,91 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-from math import floor, ceil
-
+import logging
 import os
+import sys
+from io import BytesIO
+from math import ceil, floor
+from urllib.error import HTTPError
+
 import numpy as np
-from skimage import img_as_ubyte
-from skimage.transform import resize
 
 from ludwig.constants import CROP_OR_PAD, INTERPOLATE
+from ludwig.utils.data_utils import get_abs_path
+from ludwig.utils.fs_utils import open_file, is_http, upgrade_http
+
+logger = logging.getLogger(__name__)
+
+
+def get_image_from_http_bytes(img_entry):
+    import requests
+    data = requests.get(img_entry, stream=True)
+    if data.status_code == 404:
+        upgraded = upgrade_http(img_entry)
+        if upgraded:
+            logger.info(f'reading image url {img_entry} failed. upgrading to https and retrying')
+            data = requests.get(upgraded, stream=True)
+            if data.status_code == 404:
+                raise requests.exceptions.HTTPError(f'reading image url {img_entry} failed for both http and https')
+        else:
+            raise requests.exceptions.HTTPError(f'reading image url {img_entry} failed and cannot be upgraded to https')
+    return BytesIO(data.raw.read())
+
+
+def get_image_from_path(src_path, img_entry, ret_bytes=False):
+    """
+    skimage.io.imread() can read filenames or urls
+    imghdr.what() can read filenames or bytes
+    """
+    if not isinstance(img_entry, str):
+        return img_entry
+    if is_http(img_entry):
+        if ret_bytes:
+            return get_image_from_http_bytes(img_entry)
+        return img_entry
+    if src_path or os.path.isabs(img_entry):
+        return get_abs_path(src_path, img_entry)
+    with open_file(img_entry, 'rb') as f:
+        if ret_bytes:
+            return f.read()
+        return f
+
+
+def is_image(src_path, img_entry):
+    if not isinstance(img_entry, str):
+        return False
+    try:
+        import imghdr
+
+        img = get_image_from_path(src_path, img_entry, True)
+        if isinstance(img, bytes):
+            return imghdr.what(None, img) is not None
+        return imghdr.what(img) is not None
+    except:
+        return False
+
+
+def read_image(img):
+    try:
+        from skimage.io import imread
+    except ImportError:
+        logger.error(
+            ' scikit-image is not installed. '
+            'In order to install all image feature dependencies run '
+            'pip install ludwig[image]'
+        )
+        sys.exit(-1)
+    if isinstance(img, str):
+        try:
+            return imread(img)
+        except HTTPError:
+            upgraded = upgrade_http(img)
+            if upgraded:
+                logger.info(f'reading image url {img} failed. upgrading to https and retrying')
+                return imread(upgraded)
+            logger.info(f'reading image url {img} failed and cannot be upgraded to https')
+            raise
+    return img
 
 
 def pad(img, size, axis):
@@ -58,6 +135,17 @@ def crop_or_pad(img, new_size_tuple):
 
 
 def resize_image(img, new_size_typle, resize_method):
+    try:
+        from skimage import img_as_ubyte
+        from skimage.transform import resize
+    except ImportError:
+        logger.error(
+            ' scikit-image is not installed. '
+            'In order to install all image feature dependencies run '
+            'pip install ludwig[image]'
+        )
+        sys.exit(-1)
+
     if tuple(img.shape[:2]) != new_size_typle:
         if resize_method == CROP_OR_PAD:
             return crop_or_pad(img, new_size_typle)
@@ -68,8 +156,26 @@ def resize_image(img, new_size_typle, resize_method):
     return img
 
 
-def get_abs_path(data_csv_path, image_path):
-    if data_csv_path is not None:
-        return os.path.join(data_csv_path, image_path)
+def greyscale(img):
+    try:
+        from skimage import img_as_ubyte
+        from skimage.color import rgb2gray
+    except ImportError:
+        logger.error(
+            ' scikit-image is not installed. '
+            'In order to install all image feature dependencies run '
+            'pip install ludwig[image]'
+        )
+        sys.exit(-1)
+
+    return np.expand_dims(img_as_ubyte(rgb2gray(img)), axis=2)
+
+
+def num_channels_in_image(img):
+    if img is None or img.ndim < 2:
+        raise ValueError('Invalid image data')
+
+    if img.ndim == 2:
+        return 1
     else:
-        return image_path
+        return img.shape[2]

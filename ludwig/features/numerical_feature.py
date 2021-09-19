@@ -16,393 +16,390 @@
 # ==============================================================================
 import logging
 import os
-from collections import OrderedDict
 
 import numpy as np
 import tensorflow as tf
-from tensorflow.python.ops.losses.losses_impl import Reduction
+from tensorflow.keras.metrics import (
+    MeanAbsoluteError as MeanAbsoluteErrorMetric,
+)
+from tensorflow.keras.metrics import (
+    MeanSquaredError as MeanSquaredErrorMetric,
+    RootMeanSquaredError as RootMeanSquaredErrorMetric,
+)
 
 from ludwig.constants import *
-from ludwig.features.base_feature import BaseFeature
+from ludwig.decoders.generic_decoders import Regressor
+from ludwig.encoders.generic_encoders import PassthroughEncoder, DenseEncoder
 from ludwig.features.base_feature import InputFeature
 from ludwig.features.base_feature import OutputFeature
-from ludwig.models.modules.fully_connected_modules import fc_layer
-from ludwig.models.modules.initializer_modules import get_initializer
-from ludwig.models.modules.measure_modules import \
-    absolute_error as get_absolute_error
-from ludwig.models.modules.measure_modules import error as get_error
-from ludwig.models.modules.measure_modules import r2 as get_r2
-from ludwig.models.modules.measure_modules import \
-    squared_error as get_squared_error
-from ludwig.utils.misc import set_default_value
+from ludwig.modules.loss_modules import MSELoss, MAELoss, RMSELoss, RMSPELoss
+from ludwig.modules.metric_modules import (
+    MAEMetric,
+    MSEMetric,
+    RMSEMetric,
+    RMSPEMetric,
+    R2Score,
+)
+from ludwig.utils.misc_utils import set_default_value
+from ludwig.utils.misc_utils import set_default_values
+from ludwig.utils.misc_utils import get_from_registry
+from tensorflow.keras.metrics import RootMeanSquaredError
+
+logger = logging.getLogger(__name__)
 
 
-class NumericalBaseFeature(BaseFeature):
-    def __init__(self, feature):
-        super().__init__(feature)
-        self.type = NUMERICAL
+class ZScoreTransformer:
+    def __init__(self, mean: float = None, std: float = None, **kwargs: dict):
+        self.mu = mean
+        self.sigma = std
 
+    def transform(self, x: np.ndarray) -> np.ndarray:
+        return (x - self.mu) / self.sigma
+
+    def inverse_transform(self, x: np.ndarray) -> np.ndarray:
+        return x * self.sigma + self.mu
+
+    @staticmethod
+    def fit_transform_params(column: np.ndarray, backend: "Backend") -> dict:
+        compute = backend.df_engine.compute
+        return {
+            "mean": compute(column.astype(np.float32).mean()),
+            "std": compute(column.astype(np.float32).std()),
+        }
+
+
+class MinMaxTransformer:
+    def __init__(self, min: float = None, max: float = None, **kwargs: dict):
+        self.min_value = min
+        self.max_value = max
+        self.range = None if min is None or max is None else max - min
+
+    def transform(self, x: np.ndarray) -> np.ndarray:
+        return (x - self.min_value) / self.range
+
+    def inverse_transform(self, x: np.ndarray) -> np.ndarray:
+        if self.range is None:
+            raise ValueError(
+                "Numeric transformer needs to be instantiated with "
+                "min and max values."
+            )
+        return x * self.range + self.min_value
+
+    @staticmethod
+    def fit_transform_params(column: np.ndarray, backend: "Backend") -> dict:
+        compute = backend.df_engine.compute
+        return {
+            "min": compute(column.astype(np.float32).min()),
+            "max": compute(column.astype(np.float32).max()),
+        }
+
+
+class Log1pTransformer:
+    def __init__(self, **kwargs: dict):
+        pass
+
+    def transform(self, x: np.ndarray) -> np.ndarray:
+        if np.any(x <= 0):
+            raise ValueError(
+                "One or more values are non-positive.  "
+                "log1p normalization is defined only for positive values."
+            )
+        return np.log1p(x)
+
+    def inverse_transform(self, x: np.ndarray) -> np.ndarray:
+        return np.expm1(x)
+
+    @staticmethod
+    def fit_transform_params(column: np.ndarray, backend: "Backend") -> dict:
+        return {}
+
+
+class IdentityTransformer:
+    def __init__(self, **kwargs):
+        pass
+
+    def transform(self, x: np.ndarray) -> np.ndarray:
+        return x
+
+    def inverse_transform(self, x: np.ndarray) -> np.ndarray:
+        return x
+
+    @staticmethod
+    def fit_transform_params(column: np.ndarray, backend: "Backend") -> dict:
+        return {}
+
+
+numeric_transformation_registry = {
+    "minmax": MinMaxTransformer,
+    "zscore": ZScoreTransformer,
+    "log1p": Log1pTransformer,
+    None: IdentityTransformer,
+}
+
+
+class NumericalFeatureMixin:
+    type = NUMERICAL
     preprocessing_defaults = {
-        'missing_value_strategy': FILL_WITH_CONST,
-        'fill_value': 0
+        "missing_value_strategy": FILL_WITH_CONST,
+        "fill_value": 0,
+        "normalization": None,
+    }
+
+    preprocessing_schema = {
+        "missing_value_strategy": {
+            "type": "string",
+            "enum": MISSING_VALUE_STRATEGY_OPTIONS,
+        },
+        "fill_value": {"type": "number"},
+        "computed_fill_value": {"type": "number"},
+        "normalization": {
+            "type": ["string", "null"],
+            "enum": list(numeric_transformation_registry.keys()),
+        },
     }
 
     @staticmethod
-    def get_feature_meta(column, preprocessing_parameters):
-        return {}
+    def cast_column(column, backend):
+        return backend.df_engine.df_lib.to_numeric(
+            column, errors="coerce"
+        ).astype(np.float32)
+
+    @staticmethod
+    def get_feature_meta(column, preprocessing_parameters, backend):
+        numeric_transformer = get_from_registry(
+            preprocessing_parameters.get("normalization", None),
+            numeric_transformation_registry,
+        )
+
+        return numeric_transformer.fit_transform_params(column, backend)
 
     @staticmethod
     def add_feature_data(
             feature,
-            dataset_df,
-            data,
+            input_df,
+            proc_df,
             metadata,
             preprocessing_parameters,
+            backend,
+            skip_save_processed_input,
     ):
-        data[feature['name']] = dataset_df[feature['name']].astype(
-            np.float32).as_matrix()
+        proc_df[feature[PROC_COLUMN]] = (
+            input_df[feature[COLUMN]].astype(np.float32).values
+        )
+
+        # normalize data as required
+        numeric_transformer = get_from_registry(
+            preprocessing_parameters.get("normalization", None),
+            numeric_transformation_registry,
+        )(**metadata[feature[NAME]])
+
+        proc_df[feature[PROC_COLUMN]] = numeric_transformer.transform(
+            proc_df[feature[PROC_COLUMN]]
+        )
+
+        return proc_df
 
 
-class NumericalInputFeature(NumericalBaseFeature, InputFeature):
-    def __init__(self, feature):
+class NumericalInputFeature(NumericalFeatureMixin, InputFeature):
+    encoder = "passthrough"
+
+    def __init__(self, feature, encoder_obj=None):
         super().__init__(feature)
+        self.overwrite_defaults(feature)
+        if encoder_obj:
+            self.encoder_obj = encoder_obj
+        else:
+            self.encoder_obj = self.initialize_encoder(feature)
 
-        self.norm = None
-        self.dropout = False
+    def call(self, inputs, training=None, mask=None):
+        assert isinstance(inputs, tf.Tensor)
+        assert inputs.dtype == tf.float32 or inputs.dtype == tf.float64
+        assert len(inputs.shape) == 1
 
-        _ = self.overwrite_defaults(feature)
-
-    def _get_input_placeholder(self):
-        return tf.placeholder(
-            tf.float32,
-            shape=[None],  # None is for dealing with variable batch size
-            name='{}_placeholder'.format(self.name)
+        inputs_exp = inputs[:, tf.newaxis]
+        inputs_encoded = self.encoder_obj(
+            inputs_exp, training=training, mask=mask
         )
 
-    def build_input(
-            self,
-            regularizer,
-            dropout_rate,
-            is_training=False,
-            **kwargs
-    ):
-        placeholder = self._get_input_placeholder()
+        return inputs_encoded
 
-        feature_representation = fc_layer(
-            tf.expand_dims(tf.cast(placeholder, tf.float32), 1),
-            1,
-            1,
-            activation=None,
-            norm=self.norm,
-            dropout=self.dropout,
-            dropout_rate=dropout_rate,
-            regularizer=regularizer
-        )
+    @classmethod
+    def get_input_dtype(cls):
+        return tf.float32
 
-        logging.debug('  feature_representation: {0}'.format(
-            feature_representation))
-
-        feature_representation = {'type': self.name,
-                                  'representation': feature_representation,
-                                  'size': 1,
-                                  'placeholder': placeholder}
-
-        return feature_representation
+    def get_input_shape(self):
+        return ()
 
     @staticmethod
-    def update_model_definition_with_metadata(
-            input_feature,
-            feature_metadata,
-            *args,
-            **kwargs
+    def update_config_with_metadata(
+            input_feature, feature_metadata, *args, **kwargs
     ):
         pass
 
     @staticmethod
     def populate_defaults(input_feature):
-        set_default_value(input_feature, 'tied_weights', None)
+        set_default_value(input_feature, TIED, None)
+
+    encoder_registry = {
+        "dense": DenseEncoder,
+        "passthrough": PassthroughEncoder,
+        "null": PassthroughEncoder,
+        "none": PassthroughEncoder,
+        "None": PassthroughEncoder,
+        None: PassthroughEncoder,
+    }
 
 
-class NumericalOutputFeature(NumericalBaseFeature, OutputFeature):
+class NumericalOutputFeature(NumericalFeatureMixin, OutputFeature):
+    decoder = "regressor"
+    loss = {TYPE: MEAN_SQUARED_ERROR}
+    metric_functions = {
+        LOSS: None,
+        MEAN_SQUARED_ERROR: None,
+        MEAN_ABSOLUTE_ERROR: None,
+        ROOT_MEAN_SQUARED_ERROR: None,
+        ROOT_MEAN_SQUARED_PERCENTAGE_ERROR: None,
+        R2: None,
+    }
+    default_validation_metric = MEAN_SQUARED_ERROR
+    clip = None
+
     def __init__(self, feature):
         super().__init__(feature)
+        self.overwrite_defaults(feature)
+        self.decoder_obj = self.initialize_decoder(feature)
+        self._setup_loss()
+        self._setup_metrics()
 
-        self.loss = {'type': MEAN_SQUARED_ERROR}
-        self.clip = None
-        self.initializer = None
-        self.regularize = True
+    def logits(self, inputs, **kwargs):  # hidden
+        hidden = inputs[HIDDEN]
+        return self.decoder_obj(hidden)
 
-        _ = self.overwrite_defaults(feature)
+    def predictions(self, inputs, **kwargs):  # logits
+        logits = inputs[LOGITS]
+        predictions = logits
 
-    def _get_output_placeholder(self):
-        return tf.placeholder(
-            tf.float32,
-            [None],  # None is for dealing with variable batch size
-            name='{}_placeholder'.format(self.name)
+        if self.clip is not None:
+            if isinstance(self.clip, (list, tuple)) and len(self.clip) == 2:
+                predictions = tf.clip_by_value(
+                    predictions, self.clip[0], self.clip[1]
+                )
+                logger.debug("  clipped_predictions: {0}".format(predictions))
+            else:
+                raise ValueError(
+                    "The clip parameter of {} is {}. "
+                    "It must be a list or a tuple of length 2.".format(
+                        self.feature_name, self.clip
+                    )
+                )
+
+        return {PREDICTIONS: predictions, LOGITS: logits}
+
+    def _setup_loss(self):
+        if self.loss[TYPE] == "mean_squared_error":
+            self.train_loss_function = MSELoss()
+        elif self.loss[TYPE] == "mean_absolute_error":
+            self.train_loss_function = MAELoss()
+        elif self.loss[TYPE] == "root_mean_squared_error":
+            self.train_loss_function = RMSELoss()
+        elif self.loss[TYPE] == "root_mean_squared_percentage_error":
+            self.train_loss_function = RMSPELoss()
+        else:
+            raise ValueError(
+                "Unsupported loss type {}".format(self.loss[TYPE])
+            )
+
+        self.eval_loss_function = self.train_loss_function
+
+    def _setup_metrics(self):
+        self.metric_functions = {}  # needed to shadow class variable
+        if self.loss[TYPE] == "mean_squared_error":
+            self.metric_functions[LOSS] = MSEMetric(name="eval_loss")
+        elif self.loss[TYPE] == "mean_absolute_error":
+            self.metric_functions[LOSS] = MAEMetric(name="eval_loss")
+        elif self.loss[TYPE] == "root_mean_squared_error":
+            self.metric_functions[LOSS] = RMSEMetric(name="eval_loss")
+        elif self.loss[TYPE] == "root_mean_squared_percentage_error":
+            self.metric_functions[LOSS] = RMSPEMetric(name="eval_loss")
+
+        self.metric_functions[MEAN_SQUARED_ERROR] = MeanSquaredErrorMetric(
+            name="metric_mse"
         )
+        self.metric_functions[MEAN_ABSOLUTE_ERROR] = MeanAbsoluteErrorMetric(
+            name="metric_mae"
+        )
+        self.metric_functions[
+            ROOT_MEAN_SQUARED_ERROR
+        ] = RootMeanSquaredErrorMetric(name="metric_rmse")
+        self.metric_functions[
+            ROOT_MEAN_SQUARED_PERCENTAGE_ERROR
+        ] = RMSPEMetric(name="metric_rmspe")
+        self.metric_functions[R2] = R2Score(name="metric_r2")
 
-    def _get_predictions(
-            self,
-            hidden,
-            hidden_size,
-            regularizer=None
+    def get_prediction_set(self):
+        return {PREDICTIONS, LOGITS}
+
+    @classmethod
+    def get_output_dtype(cls):
+        return tf.float32
+
+    def get_output_shape(self):
+        return ()
+
+    @staticmethod
+    def update_config_with_metadata(
+            output_feature, feature_metadata, *args, **kwargs
     ):
-        if not self.regularize:
-            regularizer = None
+        pass
 
-        with tf.variable_scope('predictions_{}'.format(self.name)):
-            initializer_obj = get_initializer(self.initializer)
-            weights = tf.get_variable(
-                'weights',
-                initializer=initializer_obj([hidden_size, 1]),
-                regularizer=regularizer
+    @staticmethod
+    def calculate_overall_stats(predictions, targets, metadata):
+        # no overall stats, just return empty dictionary
+        return {}
+
+    def postprocess_predictions(
+            self,
+            predictions,
+            metadata,
+            output_directory,
+            backend,
+    ):
+        predictions_col = f"{self.feature_name}_{PREDICTIONS}"
+        if predictions_col in predictions:
+            # as needed convert predictions make to original value space
+            numeric_transformer = get_from_registry(
+                metadata["preprocessing"].get("normalization", None),
+                numeric_transformation_registry,
+            )(**metadata)
+            predictions[predictions_col] = backend.df_engine.map_objects(
+                predictions[predictions_col],
+                lambda pred: numeric_transformer.inverse_transform(pred),
             )
-            logging.debug('  regression_weights: {0}'.format(weights))
-
-            biases = tf.get_variable('biases', [1])
-            logging.debug('  regression_biases: {0}'.format(biases))
-
-            predictions = tf.reshape(
-                tf.matmul(hidden, weights) + biases,
-                [-1]
-            )
-            logging.debug('  predictions: {0}'.format(predictions))
-
-            if self.clip is not None:
-                if isinstance(self.clip, (list, tuple)) and len(self.clip) == 2:
-                    predictions = tf.clip_by_value(
-                        predictions,
-                        self.clip[0],
-                        self.clip[1]
-                    )
-                    logging.debug(
-                        '  clipped_predictions: {0}'.format(predictions)
-                    )
-                else:
-                    raise ValueError(
-                        'The clip parameter of {} is {}. '
-                        'It must be a list or a tuple of length 2.'.format(
-                            self.name,
-                            self.clip
-                        )
-                    )
 
         return predictions
-
-    def _get_loss(self, targets, predictions):
-        with tf.variable_scope('loss_{}'.format(self.name)):
-            if self.loss['type'] == 'mean_squared_error':
-                train_loss = tf.losses.mean_squared_error(
-                    labels=targets,
-                    predictions=predictions,
-                    reduction=Reduction.NONE)
-            elif self.loss['type'] == 'mean_absolute_error':
-                train_loss = tf.losses.absolute_difference(
-                    labels=targets,
-                    predictions=predictions,
-                    reduction=Reduction.NONE
-                )
-            else:
-                train_mean_loss = None
-                train_loss = None
-                raise ValueError(
-                    'Unsupported loss type {}'.format(self.loss['type'])
-                )
-
-            train_mean_loss = tf.reduce_mean(
-                train_loss,
-                name='train_mean_loss_{}'.format(self.name)
-            )
-
-        return train_mean_loss, train_loss
-
-    def _get_measures(self, targets, predictions):
-
-        with tf.variable_scope('measures_{}'.format(self.name)):
-            error_val = get_error(
-                targets,
-                predictions,
-                self.name
-            )
-
-            absolute_error_val = get_absolute_error(
-                targets,
-                predictions,
-                self.name
-            )
-
-            squared_error_val = get_squared_error(
-                targets,
-                predictions,
-                self.name
-            )
-
-            r2_val = get_r2(targets, predictions, self.name)
-
-        return error_val, squared_error_val, absolute_error_val, r2_val
-
-    def build_output(
-            self,
-            hidden,
-            hidden_size,
-            regularizer=None,
-            **kwargs
-    ):
-        output_tensors = {}
-
-        # ================ Placeholder ================
-        targets = self._get_output_placeholder()
-        output_tensors[self.name] = targets
-        logging.debug('  targets_placeholder: {0}'.format(targets))
-
-        # ================ Predictions ================
-        predictions = self._get_predictions(
-            hidden,
-            hidden_size
-        )
-
-        output_tensors[PREDICTIONS + '_' + self.name] = predictions
-
-        # ================ Measures ================
-        error, squared_error, absolute_error, r2 = self._get_measures(
-            targets,
-            predictions
-        )
-
-        output_tensors[ERROR + '_' + self.name] = error
-        output_tensors[SQUARED_ERROR + '_' + self.name] = squared_error
-        output_tensors[ABSOLUTE_ERROR + '_' + self.name] = absolute_error
-        output_tensors[R2 + '_' + self.name] = r2
-
-        if 'sampled' not in self.loss['type']:
-            tf.summary.scalar(
-                'train_batch_mean_squared_error_{}'.format(self.name),
-                tf.reduce_mean(squared_error)
-            )
-            tf.summary.scalar(
-                'train_batch_mean_absolute_error_{}'.format(self.name),
-                tf.reduce_mean(absolute_error)
-            )
-            tf.summary.scalar(
-                'train_batch_mean_r2_{}'.format(self.name),
-                tf.reduce_mean(r2)
-            )
-
-        # ================ Loss ================
-        train_mean_loss, eval_loss = self._get_loss(targets, predictions)
-
-        output_tensors[EVAL_LOSS + '_' + self.name] = eval_loss
-        output_tensors[
-            TRAIN_MEAN_LOSS + '_' + self.name] = train_mean_loss
-
-        tf.summary.scalar(
-            'train_mean_loss_{}'.format(self.name),
-            train_mean_loss,
-        )
-
-        return train_mean_loss, eval_loss, output_tensors
-
-    default_validation_measure = MEAN_SQUARED_ERROR
-
-    output_config = OrderedDict([
-        (LOSS, {
-            'output': EVAL_LOSS,
-            'aggregation': SUM,
-            'value': 0,
-            'type': MEASURE
-        }),
-        (MEAN_SQUARED_ERROR, {
-            'output': SQUARED_ERROR,
-            'aggregation': SUM,
-            'value': 0,
-            'type': MEASURE
-        }),
-        (MEAN_ABSOLUTE_ERROR, {
-            'output': ABSOLUTE_ERROR,
-            'aggregation': SUM,
-            'value': 0,
-            'type': MEASURE
-        }),
-        (R2, {
-            'output': R2,
-            'aggregation': SUM,
-            'value': 0,
-            'type': MEASURE
-        }),
-        (ERROR, {
-            'output': ERROR,
-            'aggregation': SUM,
-            'value': 0,
-            'type': MEASURE
-        }),
-        (PREDICTIONS, {
-            'output': PREDICTIONS,
-            'aggregation': APPEND,
-            'value': [],
-            'type': PREDICTION
-        })
-    ])
-
-    @staticmethod
-    def update_model_definition_with_metadata(
-            output_feature,
-            feature_metadata,
-            *args,
-            **kwargs
-    ):
-        pass
-
-    @staticmethod
-    def calculate_overall_stats(
-            test_stats,
-            output_feature,
-            dataset,
-            train_set_metadata
-    ):
-        pass
-
-    @staticmethod
-    def postprocess_results(
-            output_feature,
-            result,
-            metadata,
-            experiment_dir_name,
-            skip_save_unprocessed_output=False
-    ):
-        postprocessed = {}
-        npy_filename = os.path.join(experiment_dir_name, '{}_{}.npy')
-        name = output_feature['name']
-
-        if PREDICTIONS in result and len(result[PREDICTIONS]) > 0:
-            postprocessed[PREDICTIONS] = result[PREDICTIONS]
-            if not skip_save_unprocessed_output:
-                np.save(
-                    npy_filename.format(name, PREDICTIONS),
-                    result[PREDICTIONS]
-                )
-            del result[PREDICTIONS]
-
-        if PROBABILITIES in result and len(result[PROBABILITIES]) > 0:
-            postprocessed[PROBABILITIES] = result[PROBABILITIES]
-            if not skip_save_unprocessed_output:
-                np.save(
-                    npy_filename.format(name, PROBABILITIES),
-                    result[PROBABILITIES]
-                )
-            del result[PROBABILITIES]
-
-        return postprocessed
 
     @staticmethod
     def populate_defaults(output_feature):
         set_default_value(
-            output_feature,
-            LOSS,
-            {'type': 'mean_squared_error', 'weight': 1}
+            output_feature, LOSS, {TYPE: "mean_squared_error", "weight": 1}
         )
-        set_default_value(output_feature[LOSS], 'type', 'mean_squared_error')
-        set_default_value(output_feature, 'clip', None)
-        set_default_value(output_feature, 'dependencies', [])
-        set_default_value(output_feature, 'weight', 1)
-        set_default_value(output_feature, 'reduce_input', SUM)
-        set_default_value(output_feature, 'reduce_dependencies', SUM)
+        set_default_value(output_feature[LOSS], TYPE, "mean_squared_error")
+        set_default_value(output_feature[LOSS], "weight", 1)
+
+        set_default_values(
+            output_feature,
+            {
+                "clip": None,
+                "dependencies": [],
+                "reduce_input": SUM,
+                "reduce_dependencies": SUM,
+            },
+        )
+
+    decoder_registry = {
+        "regressor": Regressor,
+        "null": Regressor,
+        "none": Regressor,
+        "None": Regressor,
+        None: Regressor,
+    }

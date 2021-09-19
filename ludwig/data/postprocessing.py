@@ -14,95 +14,107 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+import os
+
+import numpy as np
 import pandas as pd
 
-from ludwig.features.feature_registries import output_type_registry
+from ludwig.backend import LOCAL_BACKEND
+from ludwig.constants import BINARY
 from ludwig.features.feature_utils import SEQUENCE_TYPES
-from ludwig.utils.misc import get_from_registry
-
-
-def postprocess_results(
-        result,
-        output_feature,
-        metadata,
-        experiment_dir_name='',
-        skip_save_unprocessed_output=False
-):
-    feature = get_from_registry(
-        output_feature['type'], output_type_registry
-    )
-    return feature.postprocess_results(
-        output_feature,
-        result,
-        metadata,
-        experiment_dir_name,
-        skip_save_unprocessed_output=skip_save_unprocessed_output
-    )
+from ludwig.utils.data_utils import DICT_FORMATS, DATAFRAME_FORMATS, \
+    normalize_numpy, to_numpy_dataset
+from ludwig.utils.misc_utils import get_from_registry
 
 
 def postprocess(
-        results,
+        predictions,
         output_features,
-        metadata,
-        experiment_dir_name='',
-        skip_save_unprocessed_output=False
+        training_set_metadata,
+        output_directory='',
+        backend=LOCAL_BACKEND,
+        skip_save_unprocessed_output=False,
 ):
-    postprocessed = {}
-    for output_feature in output_features:
-        postprocessed[output_feature['name']] = postprocess_results(
-            results[output_feature['name']],
-            output_feature,
-            metadata.get(output_feature['name'], {}),
-            experiment_dir_name=experiment_dir_name,
-            skip_save_unprocessed_output=skip_save_unprocessed_output
+    if not backend.is_coordinator():
+        # Only save unprocessed output on the coordinator
+        skip_save_unprocessed_output = True
+
+    saved_keys = set()
+    if not skip_save_unprocessed_output:
+        _save_as_numpy(predictions, output_directory, saved_keys)
+
+    for of_name, output_feature in output_features.items():
+        predictions = output_feature.postprocess_predictions(
+            predictions,
+            training_set_metadata[of_name],
+            output_directory=output_directory,
+            backend=backend,
         )
-    return postprocessed
+
+    # Save any new columns but do not save the original columns again
+    if not skip_save_unprocessed_output:
+        _save_as_numpy(predictions, output_directory, saved_keys)
+
+    return predictions
 
 
-def postprocess_df(model_output, output_features, metadata):
-    postprocessed_output = postprocess(
-        model_output,
-        output_features,
-        metadata,
-        skip_save_unprocessed_output=True
+def _save_as_numpy(predictions, output_directory, saved_keys):
+    predictions = predictions[[
+        c for c in predictions.columns if c not in saved_keys
+    ]]
+    npy_filename = os.path.join(output_directory, '{}.npy')
+    numpy_predictions = to_numpy_dataset(predictions)
+    for k, v in numpy_predictions.items():
+        if k not in saved_keys:
+            np.save(npy_filename.format(k), v)
+            saved_keys.add(k)
+
+
+def convert_predictions(predictions, output_features, training_set_metadata,
+                        return_type='dict'):
+    convert_fn = get_from_registry(
+        return_type,
+        conversion_registry
     )
-    data_for_df = {}
-    for output_feature in output_features:
-        output_feature_name = output_feature['name']
-        output_feature_type = output_feature['type']
-        output_feature_dict = postprocessed_output[output_feature_name]
-        for key_val in output_feature_dict.items():
-            output_subgroup_name, output_type_value = key_val
-            if (hasattr(output_type_value, 'shape') and
-                len(output_type_value.shape)) > 1:
-                if output_feature_type in SEQUENCE_TYPES:
-                    data_for_df[
-                        '{}_{}'.format(
-                            output_feature_name,
-                            output_subgroup_name
-                        )
-                    ] = output_type_value.tolist()
-                else:
-                    for i, value in enumerate(output_type_value.T):
-                        if (output_feature_name in metadata and
-                                'idx2str' in metadata[output_feature_name]):
-                            class_name = metadata[output_feature_name][
-                                'idx2str'][i]
-                        else:
-                            class_name = str(i)
-                        data_for_df[
-                            '{}_{}_{}'.format(
-                                output_feature_name,
-                                output_subgroup_name,
-                                class_name
-                            )
-                        ] = value
-            else:
-                data_for_df[
-                    '{}_{}'.format(
-                        output_feature_name,
-                        output_subgroup_name
-                    )
-                ] = output_type_value
-    output_df = pd.DataFrame(data_for_df)
-    return output_df
+    return convert_fn(
+        predictions,
+        output_features,
+        training_set_metadata,
+    )
+
+
+def convert_to_dict(
+        predictions,
+        output_features,
+        training_set_metadata,
+):
+    output = {}
+    for of_name, output_feature in output_features.items():
+        feature_keys = {k for k in predictions.columns if k.startswith(of_name)}
+        feature_dict = {}
+        for key in feature_keys:
+            subgroup = key[len(of_name) + 1:]
+
+            values = predictions[key]
+            try:
+                values = np.stack(values.to_numpy())
+            except ValueError:
+                values = values.to_list()
+
+            feature_dict[subgroup] = values
+        output[of_name] = feature_dict
+    return output
+
+
+def convert_to_df(
+        predictions,
+        output_features,
+        training_set_metadata,
+):
+    return predictions
+
+
+conversion_registry = {
+    **{format: convert_to_dict for format in DICT_FORMATS},
+    **{format: convert_to_df for format in DATAFRAME_FORMATS},
+}
